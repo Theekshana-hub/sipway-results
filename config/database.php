@@ -1,21 +1,19 @@
 <?php
-/**
- * Sipway Campus - Database Configuration
- */
+
 
 define('DB_HOST', 'localhost');
 define('DB_USER', 'root');
 define('DB_PASS', '');
 define('DB_NAME', 'sipway_results');
 
-// Hardcoded Admin Credentials
-define('ADMIN_USERNAME', 'admin');
-define('ADMIN_PASSWORD', 'sipway2026');  // Change this after first login recommendation
 
-// App settings
+define('ADMIN_USERNAME', 'admin');
+define('ADMIN_PASSWORD', 'sipway2026'); 
+
+
 define('APP_NAME', 'Sipway Campus');
 define('APP_TITLE', 'Student Exam Results Management System');
-define('BASE_URL', '/sipway_results'); // Adjust if needed
+define('BASE_URL', '/sipway-results'); 
 
 function getConnection() {
     static $conn = null;
