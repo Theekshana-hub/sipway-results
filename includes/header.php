@@ -50,7 +50,7 @@ $title = $pageTitles[$currentPage] ?? ($pageTitle ?? 'Admin');
     </div>
 
     <nav class="sidebar-nav">
-        <div class="nav-section-label">test 1</div>
+        <div class="nav-section-label">test</div>
         <a class="nav-link <?php echo $currentPage=='index'?'active':''; ?>" href="<?php echo BASE_URL; ?>/admin/index.php">
             <i class="bi bi-speedometer2"></i> Dashboard 12
         </a>
