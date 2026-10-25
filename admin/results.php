@@ -275,7 +275,18 @@ require_once __DIR__ . '/../includes/header.php';
                         <?php endif; ?>
                     </td>
                     <td><strong><?php echo $row['full_marks'] !== null ? $row['full_marks'] : '—'; ?></strong></td>
-                    <td><?php echo $row['marks_percentage'] !== null ? number_format((float)$row['marks_percentage'], 2) . '%' : '—'; ?></td>
+                   <td>
+<?php
+    $displayPct = null;
+    $allMarksForPct = array_merge($asgList, $examList);
+    if (count($allMarksForPct) > 0) {
+        $displayPct = array_sum($allMarksForPct) / count($allMarksForPct);
+    } elseif ($row['marks_percentage'] !== null) {
+        $displayPct = (float)$row['marks_percentage'];
+    }
+    echo $displayPct !== null ? number_format($displayPct, 2) . '%' : '—';
+?>
+</td>
                     <td><?php echo $row['result_status'] ? statusBadge($row['result_status']) : statusBadge('PENDING'); ?></td>
                     <td>
                         <button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editResult<?php echo $row['student_id']; ?>">
