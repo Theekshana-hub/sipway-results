@@ -31,11 +31,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $full = array_sum($assignments) + array_sum($exams);
         if ($full == 0) $full = null;
 
+        $allMarks = array_merge($assignments, $exams);
         $pct = null;
         if (isset($_POST['marks_percentage']) && $_POST['marks_percentage'] !== '') {
             $pct = (float)$_POST['marks_percentage'];
-        } elseif ($full !== null) {
-            $pct = $full;
+        } elseif (count($allMarks) > 0) {
+            $pct = array_sum($allMarks) / count($allMarks);
         }
 
         $status  = $_POST['result_status'] ?? 'PENDING';
@@ -424,9 +425,14 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function calculateMarks(form) {
         let total = 0;
+        let count = 0;
+
         form.querySelectorAll('.mark-input').forEach(input => {
             const val = parseFloat(input.value);
-            if (!isNaN(val)) total += val;
+            if (!isNaN(val)) {
+                total += val;
+                count++;
+            }
         });
 
         const fullInput = form.querySelector('.full-marks-input');
@@ -435,8 +441,9 @@ document.addEventListener('DOMContentLoaded', function () {
         if (fullInput) {
             fullInput.value = total > 0 ? total.toFixed(2) : '';
         }
+
         if (pctInput) {
-            pctInput.value = total > 0 ? total.toFixed(2) : '';
+            pctInput.value = count > 0 ? (total / count).toFixed(2) : '';
         }
     }
 
