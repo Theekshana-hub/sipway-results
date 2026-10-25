@@ -10,7 +10,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'update') {
         $student_id = (int)$_POST['student_id'];
 
-        // Collect Assignments
         $assignments = [];
         if (!empty($_POST['assignments']) && is_array($_POST['assignments'])) {
             foreach ($_POST['assignments'] as $val) {
@@ -20,7 +19,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
 
-        // Collect Exams
         $exams = [];
         if (!empty($_POST['exams']) && is_array($_POST['exams'])) {
             foreach ($_POST['exams'] as $val) {
@@ -30,11 +28,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
 
-        // Auto Full Marks
         $full = array_sum($assignments) + array_sum($exams);
         if ($full == 0) $full = null;
 
-        $pct     = ($_POST['marks_percentage'] !== '') ? (float)$_POST['marks_percentage'] : null;
+        $pct = null;
+        if (isset($_POST['marks_percentage']) && $_POST['marks_percentage'] !== '') {
+            $pct = (float)$_POST['marks_percentage'];
+        } elseif ($full !== null) {
+            $pct = $full;
+        }
+
         $status  = $_POST['result_status'] ?? 'PENDING';
         $remarks = trim($_POST['remarks'] ?? '');
         $admin   = getAdminUsername();
@@ -42,7 +45,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $assignments_json = json_encode($assignments);
         $exams_json       = json_encode($exams);
 
-        // Old columns (string so NULL works)
         $a1 = isset($assignments[0]) ? (string)$assignments[0] : null;
         $a2 = isset($assignments[1]) ? (string)$assignments[1] : null;
         $a3 = isset($assignments[2]) ? (string)$assignments[2] : null;
@@ -96,7 +98,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if ($stmt->execute()) {
-            // Certificate update
             $payRow = $conn->query("SELECT payment_status FROM payments WHERE student_id = $student_id");
             $pay = $payRow ? $payRow->fetch_assoc() : null;
             $payOk = $pay && in_array($pay['payment_status'], ['PAID','COMPLETED','ONE_TIME','CONVA_PAY']);
@@ -125,7 +126,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// ===================== FILTERS =====================
 $filterCourse = isset($_GET['course_id']) ? (int)$_GET['course_id'] : 0;
 $filterBatch  = isset($_GET['batch_id'])  ? (int)$_GET['batch_id']  : 0;
 $filterStatus = $_GET['status'] ?? '';
@@ -161,7 +161,6 @@ if ($search) {
 $sql .= " ORDER BY c.course_code, b.batch_code, s.registration_number";
 $rows = $conn->query($sql);
 
-// Store all rows so we can render modals AFTER the table
 $allRows = [];
 if ($rows) {
     while ($r = $rows->fetch_assoc()) {
@@ -275,7 +274,7 @@ require_once __DIR__ . '/../includes/header.php';
                         <?php endif; ?>
                     </td>
                     <td><strong><?php echo $row['full_marks'] !== null ? $row['full_marks'] : '—'; ?></strong></td>
-                    <td><?php echo $row['marks_percentage'] !== null ? $row['marks_percentage'].'%' : '—'; ?></td>
+                    <td><?php echo $row['marks_percentage'] !== null ? number_format((float)$row['marks_percentage'], 2) . '%' : '—'; ?></td>
                     <td><?php echo $row['result_status'] ? statusBadge($row['result_status']) : statusBadge('PENDING'); ?></td>
                     <td>
                         <button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editResult<?php echo $row['student_id']; ?>">
@@ -291,9 +290,7 @@ require_once __DIR__ . '/../includes/header.php';
     </div>
 </div>
 
-<?php
-// ===================== ALL MODALS OUTSIDE THE TABLE =====================
-foreach ($allRows as $row):
+<?php foreach ($allRows as $row):
     $asgList = [];
     $examList = [];
 
@@ -333,7 +330,6 @@ foreach ($allRows as $row):
                         <?php echo sanitize($row['course_code'].'/'.$row['batch_code']); ?>
                     </p>
 
-                    <!-- Assignments -->
                     <div class="mb-4">
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <label class="form-label fw-bold mb-0">Assignments</label>
@@ -360,7 +356,6 @@ foreach ($allRows as $row):
                         </div>
                     </div>
 
-                    <!-- Exams -->
                     <div class="mb-4">
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <label class="form-label fw-bold mb-0">Exams</label>
@@ -393,8 +388,11 @@ foreach ($allRows as $row):
                             <input type="number" step="0.01" name="full_marks" class="form-control full-marks-input" value="<?php echo $row['full_marks'] ?? ''; ?>" readonly style="background:#f8f9fa;font-weight:bold;">
                         </div>
                         <div class="col-md-4">
-                            <label class="form-label">Percentage (%)</label>
-                            <input type="number" step="0.01" name="marks_percentage" class="form-control" value="<?php echo $row['marks_percentage'] ?? ''; ?>">
+                            <label class="form-label">Percentage (%) <small class="text-muted">(Auto)</small></label>
+                            <div class="input-group">
+                                <input type="number" step="0.01" name="marks_percentage" class="form-control percentage-input" value="<?php echo $row['marks_percentage'] ?? ''; ?>" style="background:#f8f9fa;font-weight:bold;">
+                                <span class="input-group-text">%</span>
+                            </div>
                         </div>
                         <div class="col-md-4">
                             <label class="form-label">Result Status *</label>
@@ -424,24 +422,31 @@ foreach ($allRows as $row):
 <script>
 document.addEventListener('DOMContentLoaded', function () {
 
-    function calculateFullMarks(form) {
+    function calculateMarks(form) {
         let total = 0;
         form.querySelectorAll('.mark-input').forEach(input => {
             const val = parseFloat(input.value);
             if (!isNaN(val)) total += val;
         });
+
         const fullInput = form.querySelector('.full-marks-input');
-        if (fullInput) fullInput.value = total > 0 ? total.toFixed(2) : '';
+        const pctInput  = form.querySelector('.percentage-input');
+
+        if (fullInput) {
+            fullInput.value = total > 0 ? total.toFixed(2) : '';
+        }
+        if (pctInput) {
+            pctInput.value = total > 0 ? total.toFixed(2) : '';
+        }
     }
 
     document.body.addEventListener('input', function (e) {
         if (e.target.classList.contains('mark-input')) {
             const form = e.target.closest('form');
-            if (form) calculateFullMarks(form);
+            if (form) calculateMarks(form);
         }
     });
 
-    // Add Assignment
     document.body.addEventListener('click', function (e) {
         const btn = e.target.closest('.add-assignment');
         if (!btn) return;
@@ -460,10 +465,9 @@ document.addEventListener('DOMContentLoaded', function () {
             </div>`;
         container.appendChild(div);
         updateRemoveButtons(container);
-        calculateFullMarks(btn.closest('form'));
+        calculateMarks(btn.closest('form'));
     });
 
-    // Add Exam
     document.body.addEventListener('click', function (e) {
         const btn = e.target.closest('.add-exam');
         if (!btn) return;
@@ -482,10 +486,9 @@ document.addEventListener('DOMContentLoaded', function () {
             </div>`;
         container.appendChild(div);
         updateRemoveButtons(container);
-        calculateFullMarks(btn.closest('form'));
+        calculateMarks(btn.closest('form'));
     });
 
-    // Remove
     document.body.addEventListener('click', function (e) {
         const btn = e.target.closest('.remove-item');
         if (!btn) return;
@@ -498,7 +501,7 @@ document.addEventListener('DOMContentLoaded', function () {
         item.remove();
         renumberItems(container);
         updateRemoveButtons(container);
-        if (form) calculateFullMarks(form);
+        if (form) calculateMarks(form);
     });
 
     function renumberItems(container) {
@@ -515,7 +518,7 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
-    document.querySelectorAll('.result-form').forEach(form => calculateFullMarks(form));
+    document.querySelectorAll('.result-form').forEach(form => calculateMarks(form));
 });
 </script>
 
