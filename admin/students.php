@@ -4,6 +4,54 @@ requireLogin();
 $pageTitle = 'Students';
 $conn = getConnection();
 
+
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'next_reg') {
+    header('Content-Type: application/json');
+    $batch_id = (int)($_GET['batch_id'] ?? 0);
+    if (!$batch_id) {
+        echo json_encode(['ok' => false, 'reg' => '']);
+        exit;
+    }
+    $info = $conn->query("
+        SELECT c.course_code, b.batch_code
+        FROM batches b
+        JOIN courses c ON b.course_id = c.id
+        WHERE b.id = $batch_id
+    ")->fetch_assoc();
+
+    if (!$info) {
+        echo json_encode(['ok' => false, 'reg' => '']);
+        exit;
+    }
+
+    $courseCode = $info['course_code'];
+    $batchCode  = $info['batch_code'];
+    $prefix = $courseCode . '/' . $batchCode . '/';
+    $like = $conn->real_escape_string($prefix . '%');
+
+    $res = $conn->query("
+        SELECT registration_number FROM students
+        WHERE registration_number LIKE '$like'
+        ORDER BY id DESC
+        LIMIT 50
+    ");
+
+    $maxSeq = 0;
+    if ($res) {
+        while ($r = $res->fetch_assoc()) {
+            if (preg_match('/\/(\d+)$/', $r['registration_number'], $m)) {
+                $seq = (int)$m[1];
+                if ($seq > $maxSeq) $maxSeq = $seq;
+            }
+        }
+    }
+    $next = $maxSeq + 1;
+    $reg = $prefix . str_pad($next, 3, '0', STR_PAD_LEFT);
+
+    echo json_encode(['ok' => true, 'reg' => $reg, 'course' => $courseCode, 'batch' => $batchCode]);
+    exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
@@ -16,7 +64,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $batch = (int)($_POST['batch_id'] ?? 0);
 
         if ($reg && $name && $batch) {
-            // Check duplicate registration number first
             $check = $conn->prepare("SELECT id FROM students WHERE registration_number = ?");
             $check->bind_param("s", $reg);
             $check->execute();
@@ -38,7 +85,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $conn->query("INSERT INTO payments (student_id, payment_status) VALUES ($sid, 'PENDING')");
                     $conn->query("INSERT INTO certificates (student_id, certificate_status) VALUES ($sid, 'PENDING')");
                     logActivity(getAdminUsername(), 'ADD_STUDENT', $reg);
-                    setFlash('success', 'Student added successfully.');
+                    setFlash('success', 'Student added successfully. Reg: ' . $reg);
                 } else {
                     setFlash('error', 'Error adding student: ' . $stmt->error);
                 }
@@ -65,7 +112,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $addr  = trim($_POST['address'] ?? '');
         $batch = (int)$_POST['batch_id'];
 
-        // Check duplicate (exclude current student)
         $check = $conn->prepare("SELECT id FROM students WHERE registration_number = ? AND id != ?");
         $check->bind_param("si", $reg, $id);
         $check->execute();
@@ -112,7 +158,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Filters
 $filterCourse = isset($_GET['course_id']) ? (int)$_GET['course_id'] : 0;
 $filterBatch  = isset($_GET['batch_id']) ? (int)$_GET['batch_id'] : 0;
 $search       = trim($_GET['q'] ?? '');
@@ -121,7 +166,7 @@ $coursesList = $conn->query("SELECT id, course_code, course_name FROM courses WH
 $coursesArr = [];
 while ($c = $coursesList->fetch_assoc()) $coursesArr[] = $c;
 
-$batchesList = $conn->query("SELECT b.id, b.batch_code, b.batch_name, c.course_code FROM batches b JOIN courses c ON b.course_id=c.id WHERE b.is_active=1 ORDER BY c.course_code, b.batch_code");
+$batchesList = $conn->query("SELECT b.id, b.course_id, b.batch_code, b.batch_name, c.course_code FROM batches b JOIN courses c ON b.course_id=c.id WHERE b.is_active=1 ORDER BY c.course_code, b.batch_code");
 $batchesArr = [];
 while ($b = $batchesList->fetch_assoc()) $batchesArr[] = $b;
 
@@ -299,11 +344,11 @@ require_once __DIR__ . '/../includes/header.php';
     </div>
 </div>
 
-<!-- Add Modal -->
+
 <div class="modal fade" id="addModal" tabindex="-1">
     <div class="modal-dialog modal-lg">
         <div class="modal-content">
-            <form method="POST">
+            <form method="POST" id="addStudentForm">
                 <div class="modal-header">
                     <h5 class="modal-title">Add New Student</h5>
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
@@ -312,22 +357,33 @@ require_once __DIR__ . '/../includes/header.php';
                     <input type="hidden" name="action" value="add">
                     <div class="row g-3">
                         <div class="col-md-6">
-                            <label class="form-label">Registration Number *</label>
-                            <input type="text" name="registration_number" class="form-control" placeholder="e.g. RL/B10/001" required>
-                            <small class="text-muted">Must be unique (cannot use same number twice)</small>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label">Batch *</label>
-                            <select name="batch_id" class="form-select" required>
-                                <option value="">Select Batch</option>
-                                <?php foreach ($batchesArr as $b): ?>
-                                <option value="<?php echo $b['id']; ?>">
-                                    <?php echo sanitize($b['course_code'].'/'.$b['batch_code'].' - '.$b['batch_name']); ?>
+                            <label class="form-label">Course *</label>
+                            <select id="addCourse" class="form-select" required>
+                                <option value="">Select Course first</option>
+                                <?php foreach ($coursesArr as $c): ?>
+                                <option value="<?php echo $c['id']; ?>">
+                                    <?php echo sanitize($c['course_code'].' - '.$c['course_name']); ?>
                                 </option>
                                 <?php endforeach; ?>
                             </select>
                         </div>
-                        <div class="col-12">
+                        <div class="col-md-6">
+                            <label class="form-label">Batch *</label>
+                            <select name="batch_id" id="addBatch" class="form-select" required disabled>
+                                <option value="">Select Course first</option>
+                            </select>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Registration Number *</label>
+                            <div class="input-group">
+                                <input type="text" name="registration_number" id="addRegNo" class="form-control" placeholder="Auto after batch select" required>
+                                <button type="button" class="btn btn-outline-secondary" id="btnRegenReg" title="Generate again">
+                                    <i class="bi bi-arrow-repeat"></i>
+                                </button>
+                            </div>
+                            <small class="text-muted">Format: COURSE/BATCH/001 — auto generated from Course + Batch</small>
+                        </div>
+                        <div class="col-md-6">
                             <label class="form-label">Full Name *</label>
                             <input type="text" name="full_name" class="form-control" required>
                         </div>
@@ -353,5 +409,95 @@ require_once __DIR__ . '/../includes/header.php';
         </div>
     </div>
 </div>
+
+<script>
+
+const allBatches = <?php echo json_encode(array_map(function($b) {
+    return [
+        'id' => (int)$b['id'],
+        'course_id' => (int)$b['course_id'],
+        'batch_code' => $b['batch_code'],
+        'batch_name' => $b['batch_name'],
+        'course_code' => $b['course_code'],
+        'label' => $b['course_code'] . '/' . $b['batch_code'] . ' - ' . $b['batch_name']
+    ];
+}, $batchesArr), JSON_UNESCAPED_UNICODE); ?>;
+
+const addCourse = document.getElementById('addCourse');
+const addBatch  = document.getElementById('addBatch');
+const addRegNo  = document.getElementById('addRegNo');
+const btnRegen  = document.getElementById('btnRegenReg');
+
+function loadBatchesForCourse(courseId) {
+    addBatch.innerHTML = '<option value="">Select Batch</option>';
+    addBatch.disabled = true;
+    addRegNo.value = '';
+
+    if (!courseId) return;
+
+    const filtered = allBatches.filter(b => b.course_id === parseInt(courseId));
+    if (filtered.length === 0) {
+        addBatch.innerHTML = '<option value="">No batches for this course</option>';
+        return;
+    }
+
+    filtered.forEach(b => {
+        const opt = document.createElement('option');
+        opt.value = b.id;
+        opt.textContent = b.label;
+        addBatch.appendChild(opt);
+    });
+    addBatch.disabled = false;
+}
+
+function fetchNextReg(batchId) {
+    if (!batchId) {
+        addRegNo.value = '';
+        return;
+    }
+    addRegNo.value = 'Loading...';
+    fetch('students.php?ajax=next_reg&batch_id=' + batchId)
+        .then(r => r.json())
+        .then(data => {
+            if (data.ok) {
+                addRegNo.value = data.reg;
+            } else {
+                addRegNo.value = '';
+                alert('Could not generate registration number');
+            }
+        })
+        .catch(() => {
+            addRegNo.value = '';
+            alert('Error generating registration number');
+        });
+}
+
+if (addCourse) {
+    addCourse.addEventListener('change', function () {
+        loadBatchesForCourse(this.value);
+    });
+}
+if (addBatch) {
+    addBatch.addEventListener('change', function () {
+        fetchNextReg(this.value);
+    });
+}
+if (btnRegen) {
+    btnRegen.addEventListener('click', function () {
+        if (addBatch.value) fetchNextReg(addBatch.value);
+        else alert('Please select Course and Batch first');
+    });
+}
+
+
+const addModal = document.getElementById('addModal');
+if (addModal) {
+    addModal.addEventListener('show.bs.modal', function () {
+        if (addCourse) addCourse.value = '';
+        loadBatchesForCourse('');
+        addRegNo.value = '';
+    });
+}
+</script>
 
 <?php require_once __DIR__ . '/../includes/footer.php'; ?>
