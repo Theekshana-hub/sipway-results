@@ -13,23 +13,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $phone = trim($_POST['phone'] ?? '');
         $phone2= trim($_POST['phone2'] ?? '');
         $addr  = trim($_POST['address'] ?? '');
-        $batch = (int)$_POST['batch_id'];
+        $batch = (int)($_POST['batch_id'] ?? 0);
 
         if ($reg && $name && $batch) {
-            $stmt = $conn->prepare("INSERT INTO students (registration_number, full_name, phone, phone2, address, batch_id) VALUES (?,?,?,?,?,?)");
-            $stmt->bind_param("sssssi", $reg, $name, $phone, $phone2, $addr, $batch);
-            if ($stmt->execute()) {
-                $sid = $stmt->insert_id;
-                // Auto create empty result, payment, certificate records
-                $conn->query("INSERT INTO results (student_id, result_status) VALUES ($sid, 'PENDING')");
-                $conn->query("INSERT INTO payments (student_id, payment_status) VALUES ($sid, 'PENDING')");
-                $conn->query("INSERT INTO certificates (student_id, certificate_status) VALUES ($sid, 'PENDING')");
-                logActivity(getAdminUsername(), 'ADD_STUDENT', $reg);
-                setFlash('success', 'Student added successfully.');
-            } else {
-                setFlash('error', 'Error: ' . $conn->error);
+            // Check duplicate registration number first
+            $check = $conn->prepare("SELECT id FROM students WHERE registration_number = ?");
+            $check->bind_param("s", $reg);
+            $check->execute();
+            $check->store_result();
+
+            if ($check->num_rows > 0) {
+                $check->close();
+                setFlash('error', 'Registration Number "' . $reg . '" already exists. Please use a different number.');
+                redirect('students.php');
             }
-            $stmt->close();
+            $check->close();
+
+            try {
+                $stmt = $conn->prepare("INSERT INTO students (registration_number, full_name, phone, phone2, address, batch_id) VALUES (?,?,?,?,?,?)");
+                $stmt->bind_param("sssssi", $reg, $name, $phone, $phone2, $addr, $batch);
+                if ($stmt->execute()) {
+                    $sid = $stmt->insert_id;
+                    $conn->query("INSERT INTO results (student_id, result_status) VALUES ($sid, 'PENDING')");
+                    $conn->query("INSERT INTO payments (student_id, payment_status) VALUES ($sid, 'PENDING')");
+                    $conn->query("INSERT INTO certificates (student_id, certificate_status) VALUES ($sid, 'PENDING')");
+                    logActivity(getAdminUsername(), 'ADD_STUDENT', $reg);
+                    setFlash('success', 'Student added successfully.');
+                } else {
+                    setFlash('error', 'Error adding student: ' . $stmt->error);
+                }
+                $stmt->close();
+            } catch (mysqli_sql_exception $e) {
+                if (strpos($e->getMessage(), 'Duplicate') !== false) {
+                    setFlash('error', 'Registration Number "' . $reg . '" already exists. Please use a different number.');
+                } else {
+                    setFlash('error', 'Database error: ' . $e->getMessage());
+                }
+            }
+        } else {
+            setFlash('error', 'Please fill Registration Number, Full Name and Batch.');
         }
         redirect('students.php');
     }
@@ -42,23 +64,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $phone2= trim($_POST['phone2'] ?? '');
         $addr  = trim($_POST['address'] ?? '');
         $batch = (int)$_POST['batch_id'];
-        $stmt = $conn->prepare("UPDATE students SET registration_number=?, full_name=?, phone=?, phone2=?, address=?, batch_id=? WHERE id=?");
-        $stmt->bind_param("sssssii", $reg, $name, $phone, $phone2, $addr, $batch, $id);
-        if ($stmt->execute()) {
-            setFlash('success', 'Student updated.');
+
+        // Check duplicate (exclude current student)
+        $check = $conn->prepare("SELECT id FROM students WHERE registration_number = ? AND id != ?");
+        $check->bind_param("si", $reg, $id);
+        $check->execute();
+        $check->store_result();
+        if ($check->num_rows > 0) {
+            $check->close();
+            setFlash('error', 'Registration Number "' . $reg . '" already exists for another student.');
+            redirect('students.php');
         }
-        $stmt->close();
+        $check->close();
+
+        try {
+            $stmt = $conn->prepare("UPDATE students SET registration_number=?, full_name=?, phone=?, phone2=?, address=?, batch_id=? WHERE id=?");
+            $stmt->bind_param("sssssii", $reg, $name, $phone, $phone2, $addr, $batch, $id);
+            if ($stmt->execute()) {
+                setFlash('success', 'Student updated.');
+            } else {
+                setFlash('error', 'Error updating student.');
+            }
+            $stmt->close();
+        } catch (mysqli_sql_exception $e) {
+            if (strpos($e->getMessage(), 'Duplicate') !== false) {
+                setFlash('error', 'Registration Number "' . $reg . '" already exists.');
+            } else {
+                setFlash('error', 'Database error: ' . $e->getMessage());
+            }
+        }
         redirect('students.php');
     }
 
     if ($action === 'delete') {
         $id = (int)$_POST['id'];
-        $stmt = $conn->prepare("DELETE FROM students WHERE id=?");
-        $stmt->bind_param("i", $id);
-        if ($stmt->execute()) {
-            setFlash('success', 'Student deleted.');
+        try {
+            $stmt = $conn->prepare("DELETE FROM students WHERE id=?");
+            $stmt->bind_param("i", $id);
+            if ($stmt->execute()) {
+                setFlash('success', 'Student deleted.');
+            }
+            $stmt->close();
+        } catch (mysqli_sql_exception $e) {
+            setFlash('error', 'Cannot delete student: ' . $e->getMessage());
         }
-        $stmt->close();
         redirect('students.php');
     }
 }
@@ -157,7 +206,7 @@ require_once __DIR__ . '/../includes/header.php';
                 </tr>
             </thead>
             <tbody>
-                <?php if ($students->num_rows > 0): ?>
+                <?php if ($students && $students->num_rows > 0): ?>
                 <?php while ($row = $students->fetch_assoc()): ?>
                 <tr>
                     <td><code><?php echo sanitize($row['registration_number']); ?></code></td>
@@ -189,7 +238,6 @@ require_once __DIR__ . '/../includes/header.php';
                     </td>
                 </tr>
 
-                <!-- Edit Modal -->
                 <div class="modal fade" id="editModal<?php echo $row['id']; ?>" tabindex="-1">
                     <div class="modal-dialog modal-lg">
                         <div class="modal-content">
@@ -266,6 +314,7 @@ require_once __DIR__ . '/../includes/header.php';
                         <div class="col-md-6">
                             <label class="form-label">Registration Number *</label>
                             <input type="text" name="registration_number" class="form-control" placeholder="e.g. RL/B10/001" required>
+                            <small class="text-muted">Must be unique (cannot use same number twice)</small>
                         </div>
                         <div class="col-md-6">
                             <label class="form-label">Batch *</label>
