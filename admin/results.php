@@ -4,27 +4,106 @@ requireLogin();
 $pageTitle = 'Results';
 $conn = getConnection();
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
+// ============================================
+// EXCEL / CSV UPLOAD HANDLER
+// ============================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'upload') {
+    $admin = getAdminUsername();
+    $uploaded = 0;
+    $updated = 0;
+    $skipped = 0;
+    $errors  = [];
 
-    if ($action === 'update') {
-        $student_id = (int)$_POST['student_id'];
+    if (!isset($_FILES['excel_file']) || $_FILES['excel_file']['error'] !== UPLOAD_ERR_OK) {
+        setFlash('error', 'Please select a valid Excel/CSV file.');
+        redirect('results.php');
+    }
 
-        $assignments = [];
-        if (!empty($_POST['assignments']) && is_array($_POST['assignments'])) {
-            foreach ($_POST['assignments'] as $val) {
-                if ($val !== '' && is_numeric($val)) {
-                    $assignments[] = (float)$val;
+    $file     = $_FILES['excel_file'];
+    $ext      = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    $tmpPath  = $file['tmp_name'];
+
+    if (!in_array($ext, ['xlsx', 'xls', 'csv'])) {
+        setFlash('error', 'Only .xlsx, .xls or .csv files are allowed.');
+        redirect('results.php');
+    }
+
+    $rows = [];
+
+    // ---------- Read file ----------
+    if ($ext === 'csv') {
+        if (($handle = fopen($tmpPath, 'r')) !== false) {
+            $header = fgetcsv($handle);
+            while (($data = fgetcsv($handle)) !== false) {
+                if (count(array_filter($data)) === 0) continue; // empty row
+                $rows[] = array_combine($header, $data);
+            }
+            fclose($handle);
+        }
+    } else {
+        // PhpSpreadsheet
+        require_once __DIR__ . '/../vendor/autoload.php'; // Composer autoload
+
+        try {
+            $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($tmpPath);
+            $sheet = $spreadsheet->getActiveSheet();
+            $data  = $sheet->toArray(null, true, true, true);
+
+            $header = array_shift($data); // first row = headers
+            $header = array_map('trim', array_map('strtolower', $header));
+
+            foreach ($data as $row) {
+                if (count(array_filter($row)) === 0) continue;
+                $combined = [];
+                foreach ($header as $col => $key) {
+                    $combined[$key] = isset($row[$col]) ? trim($row[$col]) : '';
                 }
+                $rows[] = $combined;
+            }
+        } catch (Exception $e) {
+            setFlash('error', 'Failed to read Excel file: ' . $e->getMessage());
+            redirect('results.php');
+        }
+    }
+
+    // ---------- Process each row ----------
+    foreach ($rows as $index => $row) {
+        $lineNo = $index + 2; // Excel row number
+
+        $regNo = trim($row['registration_number'] ?? $row['reg_number'] ?? $row['reg'] ?? '');
+        if ($regNo === '') {
+            $skipped++;
+            continue;
+        }
+
+        // Find student
+        $stmt = $conn->prepare("SELECT id FROM students WHERE registration_number = ? AND is_active = 1 LIMIT 1");
+        $stmt->bind_param("s", $regNo);
+        $stmt->execute();
+        $student = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        if (!$student) {
+            $errors[] = "Row $lineNo: Student not found → $regNo";
+            $skipped++;
+            continue;
+        }
+
+        $student_id = (int)$student['id'];
+
+        // Collect assignments
+        $assignments = [];
+        foreach (['assignment1', 'assignment2', 'assignment3', 'assignment4', 'assignment5'] as $key) {
+            if (isset($row[$key]) && $row[$key] !== '' && is_numeric($row[$key])) {
+                $assignments[] = (float)$row[$key];
             }
         }
 
+        // Collect exams
         $exams = [];
-        if (!empty($_POST['exams']) && is_array($_POST['exams'])) {
-            foreach ($_POST['exams'] as $val) {
-                if ($val !== '' && is_numeric($val)) {
-                    $exams[] = (float)$val;
-                }
+        foreach (['exam1', 'exam2', 'exam3', 'final_exam'] as $key) {
+            if (isset($row[$key]) && $row[$key] !== '' && is_numeric($row[$key])) {
+                $exams[] = (float)$row[$key];
             }
         }
 
@@ -33,15 +112,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $allMarks = array_merge($assignments, $exams);
         $pct = null;
-        if (isset($_POST['marks_percentage']) && $_POST['marks_percentage'] !== '') {
-            $pct = (float)$_POST['marks_percentage'];
-        } elseif (count($allMarks) > 0) {
+        if (count($allMarks) > 0) {
             $pct = array_sum($allMarks) / count($allMarks);
         }
 
-        $status  = $_POST['result_status'] ?? 'PENDING';
-        $remarks = trim($_POST['remarks'] ?? '');
-        $admin   = getAdminUsername();
+        $status  = strtoupper(trim($row['result_status'] ?? $row['status'] ?? 'PENDING'));
+        $allowed = ['PRESENT', 'ABSENT', 'PENDING', 'NOT_ELIGIBLE'];
+        if (!in_array($status, $allowed)) $status = 'PENDING';
+
+        $remarks = trim($row['remarks'] ?? '');
 
         $assignments_json = json_encode($assignments);
         $exams_json       = json_encode($exams);
@@ -50,24 +129,133 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $a2 = isset($assignments[1]) ? (string)$assignments[1] : null;
         $a3 = isset($assignments[2]) ? (string)$assignments[2] : null;
         $fe = isset($exams[0])       ? (string)$exams[0]       : null;
-
         $full_s = $full !== null ? (string)$full : null;
         $pct_s  = $pct  !== null ? (string)$pct  : null;
 
+        // Check existing
         $check = $conn->query("SELECT id FROM results WHERE student_id = $student_id");
-
         if ($check && $check->num_rows > 0) {
             $stmt = $conn->prepare("UPDATE results SET 
                 assignment1 = ?, assignment2 = ?, assignment3 = ?, final_exam = ?,
                 full_marks = ?, marks_percentage = ?, result_status = ?, remarks = ?,
                 entered_by = ?, assignments_json = ?, exams_json = ?
                 WHERE student_id = ?");
+            $stmt->bind_param(
+                "sssssssssssi",
+                $a1, $a2, $a3, $fe,
+                $full_s, $pct_s,
+                $status, $remarks, $admin,
+                $assignments_json, $exams_json,
+                $student_id
+            );
+            $isUpdate = true;
+        } else {
+            $stmt = $conn->prepare("INSERT INTO results 
+                (student_id, assignment1, assignment2, assignment3, final_exam,
+                 full_marks, marks_percentage, result_status, remarks, entered_by,
+                 assignments_json, exams_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+            $stmt->bind_param(
+                "isssssssssss",
+                $student_id,
+                $a1, $a2, $a3, $fe,
+                $full_s, $pct_s,
+                $status, $remarks, $admin,
+                $assignments_json, $exams_json
+            );
+            $isUpdate = false;
+        }
 
+        if ($stmt->execute()) {
+            // Certificate status update (same logic as single update)
+            $payRow = $conn->query("SELECT payment_status FROM payments WHERE student_id = $student_id");
+            $pay = $payRow ? $payRow->fetch_assoc() : null;
+            $payOk = $pay && in_array($pay['payment_status'], ['PAID','COMPLETED','ONE_TIME','CONVA_PAY']);
+            $passOk = ($status === 'PRESENT') && (($full !== null && $full >= 40) || ($pct !== null && $pct >= 40));
+
+            if ($status === 'ABSENT' || $status === 'NOT_ELIGIBLE') {
+                $conn->query("UPDATE certificates SET certificate_status = 'NOT_ELIGIBLE' WHERE student_id = $student_id");
+            } elseif ($passOk && $payOk) {
+                $conn->query("UPDATE certificates SET certificate_status = 'READY' WHERE student_id = $student_id");
+            } else {
+                $conn->query("UPDATE certificates SET certificate_status = 'PENDING' WHERE student_id = $student_id");
+            }
+
+            if ($isUpdate) $updated++;
+            else $uploaded++;
+        } else {
+            $errors[] = "Row $lineNo ($regNo): " . $stmt->error;
+            $skipped++;
+        }
+        $stmt->close();
+    }
+
+    logActivity($admin, 'BULK_UPLOAD_RESULTS', "Uploaded: $uploaded | Updated: $updated | Skipped: $skipped");
+
+    $msg = "Bulk upload finished. New: $uploaded | Updated: $updated | Skipped: $skipped";
+    if (!empty($errors)) {
+        $msg .= " | Errors: " . count($errors);
+        // You can log errors or show first few
+        $_SESSION['upload_errors'] = array_slice($errors, 0, 10);
+    }
+    setFlash('success', $msg);
+    redirect('results.php');
+}
+
+// ============================================
+// SINGLE UPDATE HANDLER (your existing code)
+// ============================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    if ($action === 'update') {
+        $student_id = (int)$_POST['student_id'];
+        $assignments = [];
+        if (!empty($_POST['assignments']) && is_array($_POST['assignments'])) {
+            foreach ($_POST['assignments'] as $val) {
+                if ($val !== '' && is_numeric($val)) {
+                    $assignments[] = (float)$val;
+                }
+            }
+        }
+        $exams = [];
+        if (!empty($_POST['exams']) && is_array($_POST['exams'])) {
+            foreach ($_POST['exams'] as $val) {
+                if ($val !== '' && is_numeric($val)) {
+                    $exams[] = (float)$val;
+                }
+            }
+        }
+        $full = array_sum($assignments) + array_sum($exams);
+        if ($full == 0) $full = null;
+        $allMarks = array_merge($assignments, $exams);
+        $pct = null;
+        if (isset($_POST['marks_percentage']) && $_POST['marks_percentage'] !== '') {
+            $pct = (float)$_POST['marks_percentage'];
+        } elseif (count($allMarks) > 0) {
+            $pct = array_sum($allMarks) / count($allMarks);
+        }
+        $status  = $_POST['result_status'] ?? 'PENDING';
+        $remarks = trim($_POST['remarks'] ?? '');
+        $admin   = getAdminUsername();
+        $assignments_json = json_encode($assignments);
+        $exams_json       = json_encode($exams);
+        $a1 = isset($assignments[0]) ? (string)$assignments[0] : null;
+        $a2 = isset($assignments[1]) ? (string)$assignments[1] : null;
+        $a3 = isset($assignments[2]) ? (string)$assignments[2] : null;
+        $fe = isset($exams[0])       ? (string)$exams[0]       : null;
+        $full_s = $full !== null ? (string)$full : null;
+        $pct_s  = $pct  !== null ? (string)$pct  : null;
+        $check = $conn->query("SELECT id FROM results WHERE student_id = $student_id");
+        if ($check && $check->num_rows > 0) {
+            $stmt = $conn->prepare("UPDATE results SET 
+                assignment1 = ?, assignment2 = ?, assignment3 = ?, final_exam = ?,
+                full_marks = ?, marks_percentage = ?, result_status = ?, remarks = ?,
+                entered_by = ?, assignments_json = ?, exams_json = ?
+                WHERE student_id = ?");
             if (!$stmt) {
                 setFlash('error', 'Prepare failed: ' . $conn->error);
                 redirect('results.php');
             }
-
             $stmt->bind_param(
                 "sssssssssssi",
                 $a1, $a2, $a3, $fe,
@@ -82,12 +270,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                  full_marks, marks_percentage, result_status, remarks, entered_by,
                  assignments_json, exams_json)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
-
             if (!$stmt) {
                 setFlash('error', 'Prepare failed: ' . $conn->error);
                 redirect('results.php');
             }
-
             $stmt->bind_param(
                 "isssssssssss",
                 $student_id,
@@ -97,13 +283,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $assignments_json, $exams_json
             );
         }
-
         if ($stmt->execute()) {
             $payRow = $conn->query("SELECT payment_status FROM payments WHERE student_id = $student_id");
             $pay = $payRow ? $payRow->fetch_assoc() : null;
             $payOk = $pay && in_array($pay['payment_status'], ['PAID','COMPLETED','ONE_TIME','CONVA_PAY']);
             $passOk = ($status === 'PRESENT') && (($full !== null && $full >= 40) || ($pct !== null && $pct >= 40));
-
             if ($status === 'ABSENT' || $status === 'NOT_ELIGIBLE') {
                 $conn->query("UPDATE certificates SET certificate_status = 'NOT_ELIGIBLE' WHERE student_id = $student_id");
             } elseif ($passOk && $payOk) {
@@ -111,13 +295,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } else {
                 $conn->query("UPDATE certificates SET certificate_status = 'PENDING' WHERE student_id = $student_id");
             }
-
             logActivity($admin, 'UPDATE_RESULT', "Student ID: $student_id | Asg: " . count($assignments) . " | Exam: " . count($exams));
             setFlash('success', 'Result updated successfully. (Assignments: ' . count($assignments) . ', Exams: ' . count($exams) . ')');
         } else {
             setFlash('error', 'Save failed: ' . $stmt->error);
         }
-
         $stmt->close();
         redirect('results.php?' . http_build_query(array_filter([
             'course_id' => $_POST['redirect_course'] ?? '',
@@ -127,6 +309,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
+// ============================================
+// FILTERS + DATA FETCH (your existing code)
+// ============================================
 $filterCourse = isset($_GET['course_id']) ? (int)$_GET['course_id'] : 0;
 $filterBatch  = isset($_GET['batch_id'])  ? (int)$_GET['batch_id']  : 0;
 $filterStatus = $_GET['status'] ?? '';
@@ -161,7 +346,6 @@ if ($search) {
 }
 $sql .= " ORDER BY c.course_code, b.batch_code, s.registration_number";
 $rows = $conn->query($sql);
-
 $allRows = [];
 if ($rows) {
     while ($r = $rows->fetch_assoc()) {
@@ -172,6 +356,44 @@ if ($rows) {
 require_once __DIR__ . '/../includes/header.php';
 ?>
 
+<!-- ==================== UPLOAD SECTION ==================== -->
+<div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-file-earmark-excel"></i> Bulk Upload Results (Excel / CSV)</h5>
+        <a href="download_sample_results.php" class="btn btn-sm btn-outline-success">
+            <i class="bi bi-download"></i> Download Sample Excel
+        </a>
+    </div>
+    <div class="card-body">
+        <form method="POST" enctype="multipart/form-data" class="row g-3 align-items-end">
+            <input type="hidden" name="action" value="upload">
+            <div class="col-md-6">
+                <label class="form-label">Select Excel / CSV File</label>
+                <input type="file" name="excel_file" class="form-control" accept=".xlsx,.xls,.csv" required>
+                <small class="text-muted">Supported: .xlsx, .xls, .csv • Max recommended: 500 rows</small>
+            </div>
+            <div class="col-md-3">
+                <button type="submit" class="btn btn-success w-100">
+                    <i class="bi bi-upload"></i> Upload & Process
+                </button>
+            </div>
+        </form>
+
+        <?php if (!empty($_SESSION['upload_errors'])): ?>
+            <div class="alert alert-warning mt-3">
+                <strong>Some rows had issues:</strong>
+                <ul class="mb-0">
+                    <?php foreach ($_SESSION['upload_errors'] as $err): ?>
+                        <li><?php echo htmlspecialchars($err); ?></li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+            <?php unset($_SESSION['upload_errors']); ?>
+        <?php endif; ?>
+    </div>
+</div>
+
+<!-- ==================== FILTER BAR ==================== -->
 <div class="filter-bar">
     <form method="GET" class="row g-2 align-items-end">
         <div class="col-md-2">
@@ -212,6 +434,7 @@ require_once __DIR__ . '/../includes/header.php';
     </form>
 </div>
 
+<!-- ==================== TABLE (your existing table code) ==================== -->
 <div class="card table-card">
     <div class="table-responsive">
         <table class="table table-hover mb-0">
@@ -232,7 +455,6 @@ require_once __DIR__ . '/../includes/header.php';
                 <?php if (count($allRows) > 0): foreach ($allRows as $row): 
                     $asgList = [];
                     $examList = [];
-
                     if (!empty($row['assignments_json'])) {
                         $decoded = json_decode($row['assignments_json'], true);
                         if (is_array($decoded)) $asgList = $decoded;
@@ -241,7 +463,6 @@ require_once __DIR__ . '/../includes/header.php';
                         if ($row['assignment2'] !== null && $row['assignment2'] !== '') $asgList[] = $row['assignment2'];
                         if ($row['assignment3'] !== null && $row['assignment3'] !== '') $asgList[] = $row['assignment3'];
                     }
-
                     if (!empty($row['exams_json'])) {
                         $decoded = json_decode($row['exams_json'], true);
                         if (is_array($decoded)) $examList = $decoded;
@@ -302,10 +523,10 @@ require_once __DIR__ . '/../includes/header.php';
     </div>
 </div>
 
+<!-- ==================== EDIT MODALS (your existing modals + JS) ==================== -->
 <?php foreach ($allRows as $row):
     $asgList = [];
     $examList = [];
-
     if (!empty($row['assignments_json'])) {
         $decoded = json_decode($row['assignments_json'], true);
         if (is_array($decoded)) $asgList = $decoded;
@@ -314,7 +535,6 @@ require_once __DIR__ . '/../includes/header.php';
         if ($row['assignment2'] !== null && $row['assignment2'] !== '') $asgList[] = $row['assignment2'];
         if ($row['assignment3'] !== null && $row['assignment3'] !== '') $asgList[] = $row['assignment3'];
     }
-
     if (!empty($row['exams_json'])) {
         $decoded = json_decode($row['exams_json'], true);
         if (is_array($decoded)) $examList = $decoded;
@@ -336,12 +556,10 @@ require_once __DIR__ . '/../includes/header.php';
                     <input type="hidden" name="redirect_course" value="<?php echo $filterCourse; ?>">
                     <input type="hidden" name="redirect_batch" value="<?php echo $filterBatch; ?>">
                     <input type="hidden" name="redirect_q" value="<?php echo sanitize($search); ?>">
-
                     <p class="text-muted mb-3">
                         <?php echo sanitize($row['full_name']); ?> | 
                         <?php echo sanitize($row['course_code'].'/'.$row['batch_code']); ?>
                     </p>
-
                     <div class="mb-4">
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <label class="form-label fw-bold mb-0">Assignments</label>
@@ -367,7 +585,6 @@ require_once __DIR__ . '/../includes/header.php';
                             <?php endfor; ?>
                         </div>
                     </div>
-
                     <div class="mb-4">
                         <div class="d-flex justify-content-between align-items-center mb-2">
                             <label class="form-label fw-bold mb-0">Exams</label>
@@ -393,7 +610,6 @@ require_once __DIR__ . '/../includes/header.php';
                             <?php endfor; ?>
                         </div>
                     </div>
-
                     <div class="row g-3">
                         <div class="col-md-4">
                             <label class="form-label">Full Marks <small class="text-muted">(Auto)</small></label>
@@ -433,11 +649,9 @@ require_once __DIR__ . '/../includes/header.php';
 
 <script>
 document.addEventListener('DOMContentLoaded', function () {
-
     function calculateMarks(form) {
         let total = 0;
         let count = 0;
-
         form.querySelectorAll('.mark-input').forEach(input => {
             const val = parseFloat(input.value);
             if (!isNaN(val)) {
@@ -445,34 +659,27 @@ document.addEventListener('DOMContentLoaded', function () {
                 count++;
             }
         });
-
         const fullInput = form.querySelector('.full-marks-input');
         const pctInput  = form.querySelector('.percentage-input');
-
         if (fullInput) {
             fullInput.value = total > 0 ? total.toFixed(2) : '';
         }
-
         if (pctInput) {
             pctInput.value = count > 0 ? (total / count).toFixed(2) : '';
         }
     }
-
     document.body.addEventListener('input', function (e) {
         if (e.target.classList.contains('mark-input')) {
             const form = e.target.closest('form');
             if (form) calculateMarks(form);
         }
     });
-
     document.body.addEventListener('click', function (e) {
         const btn = e.target.closest('.add-assignment');
         if (!btn) return;
         e.preventDefault();
-
         const container = btn.closest('.mb-4').querySelector('.assignments-container');
         const count = container.querySelectorAll('.assignment-item').length + 1;
-
         const div = document.createElement('div');
         div.className = 'col-md-4 assignment-item';
         div.innerHTML = `
@@ -485,15 +692,12 @@ document.addEventListener('DOMContentLoaded', function () {
         updateRemoveButtons(container);
         calculateMarks(btn.closest('form'));
     });
-
     document.body.addEventListener('click', function (e) {
         const btn = e.target.closest('.add-exam');
         if (!btn) return;
         e.preventDefault();
-
         const container = btn.closest('.mb-4').querySelector('.exams-container');
         const count = container.querySelectorAll('.exam-item').length + 1;
-
         const div = document.createElement('div');
         div.className = 'col-md-4 exam-item';
         div.innerHTML = `
@@ -506,36 +710,30 @@ document.addEventListener('DOMContentLoaded', function () {
         updateRemoveButtons(container);
         calculateMarks(btn.closest('form'));
     });
-
     document.body.addEventListener('click', function (e) {
         const btn = e.target.closest('.remove-item');
         if (!btn) return;
         e.preventDefault();
-
         const item = btn.closest('.assignment-item, .exam-item');
         const container = item.parentElement;
         const form = item.closest('form');
-
         item.remove();
         renumberItems(container);
         updateRemoveButtons(container);
         if (form) calculateMarks(form);
     });
-
     function renumberItems(container) {
         const prefix = container.classList.contains('assignments-container') ? 'A' : 'E';
         container.querySelectorAll('.assignment-item, .exam-item').forEach((item, i) => {
             item.querySelector('.input-group-text').textContent = prefix + (i + 1);
         });
     }
-
     function updateRemoveButtons(container) {
         const items = container.querySelectorAll('.assignment-item, .exam-item');
         items.forEach(item => {
             item.querySelector('.remove-item').disabled = items.length <= 1;
         });
     }
-
     document.querySelectorAll('.result-form').forEach(form => calculateMarks(form));
 });
 </script>
