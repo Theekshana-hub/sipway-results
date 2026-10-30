@@ -4,7 +4,9 @@ requireLogin();
 $pageTitle = 'Students';
 $conn = getConnection();
 
-
+// ============================================
+// AJAX: Next Registration Number
+// ============================================
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'next_reg') {
     header('Content-Type: application/json');
     $batch_id = (int)($_GET['batch_id'] ?? 0);
@@ -52,6 +54,202 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'next_reg') {
     exit;
 }
 
+// ============================================
+// HELPER: Generate next reg number for a batch
+// ============================================
+function generateNextReg($conn, $batch_id) {
+    $info = $conn->query("
+        SELECT c.course_code, b.batch_code
+        FROM batches b
+        JOIN courses c ON b.course_id = c.id
+        WHERE b.id = $batch_id
+    ")->fetch_assoc();
+
+    if (!$info) return null;
+
+    $prefix = $info['course_code'] . '/' . $info['batch_code'] . '/';
+    $like = $conn->real_escape_string($prefix . '%');
+
+    $res = $conn->query("
+        SELECT registration_number FROM students
+        WHERE registration_number LIKE '$like'
+        ORDER BY id DESC
+        LIMIT 50
+    ");
+
+    $maxSeq = 0;
+    if ($res) {
+        while ($r = $res->fetch_assoc()) {
+            if (preg_match('/\/(\d+)$/', $r['registration_number'], $m)) {
+                $seq = (int)$m[1];
+                if ($seq > $maxSeq) $maxSeq = $seq;
+            }
+        }
+    }
+    return $prefix . str_pad($maxSeq + 1, 3, '0', STR_PAD_LEFT);
+}
+
+// ============================================
+// BULK EXCEL / CSV UPLOAD HANDLER
+// ============================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'upload') {
+    $admin = getAdminUsername();
+    $uploaded = 0;
+    $skipped  = 0;
+    $errors   = [];
+
+    if (!isset($_FILES['excel_file']) || $_FILES['excel_file']['error'] !== UPLOAD_ERR_OK) {
+        setFlash('error', 'Please select a valid Excel/CSV file.');
+        redirect('students.php');
+    }
+
+    $file    = $_FILES['excel_file'];
+    $ext     = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    $tmpPath = $file['tmp_name'];
+
+    if (!in_array($ext, ['xlsx', 'xls', 'csv'])) {
+        setFlash('error', 'Only .xlsx, .xls or .csv files are allowed.');
+        redirect('students.php');
+    }
+
+    $rows = [];
+
+    // ---------- Read file ----------
+    if ($ext === 'csv') {
+        if (($handle = fopen($tmpPath, 'r')) !== false) {
+            $header = fgetcsv($handle);
+            $header = array_map(function($h) { return strtolower(trim($h)); }, $header);
+            while (($data = fgetcsv($handle)) !== false) {
+                if (count(array_filter($data)) === 0) continue;
+                $rows[] = array_combine($header, $data);
+            }
+            fclose($handle);
+        }
+    } else {
+        require_once __DIR__ . '/../vendor/autoload.php';
+
+        try {
+            $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($tmpPath);
+            $sheet = $spreadsheet->getActiveSheet();
+            $data  = $sheet->toArray(null, true, true, true);
+
+            $headerRow = array_shift($data);
+            $header = [];
+            foreach ($headerRow as $col => $val) {
+                $header[$col] = strtolower(trim((string)$val));
+            }
+
+            foreach ($data as $row) {
+                if (count(array_filter($row)) === 0) continue;
+                $combined = [];
+                foreach ($header as $col => $key) {
+                    $combined[$key] = isset($row[$col]) ? trim((string)$row[$col]) : '';
+                }
+                $rows[] = $combined;
+            }
+        } catch (Exception $e) {
+            setFlash('error', 'Failed to read Excel file: ' . $e->getMessage());
+            redirect('students.php');
+        }
+    }
+
+    // ---------- Process each row ----------
+    foreach ($rows as $index => $row) {
+        $lineNo = $index + 2;
+
+        $reg        = trim($row['registration_number'] ?? $row['reg_number'] ?? $row['reg'] ?? '');
+        $courseCode = trim($row['course_code'] ?? $row['course'] ?? '');
+        $batchCode  = trim($row['batch_code'] ?? $row['batch'] ?? '');
+        $name       = trim($row['full_name'] ?? $row['name'] ?? '');
+        $phone      = trim($row['phone'] ?? '');
+        $phone2     = trim($row['phone2'] ?? $row['phone_2'] ?? '');
+        $addr       = trim($row['address'] ?? '');
+
+        // Validation
+        if ($name === '' || $courseCode === '' || $batchCode === '') {
+            $errors[] = "Row $lineNo: Missing required fields (course_code / batch_code / full_name)";
+            $skipped++;
+            continue;
+        }
+
+        // Find batch_id
+        $batchStmt = $conn->prepare("
+            SELECT b.id 
+            FROM batches b 
+            JOIN courses c ON b.course_id = c.id 
+            WHERE c.course_code = ? AND b.batch_code = ? AND b.is_active = 1
+            LIMIT 1
+        ");
+        $batchStmt->bind_param("ss", $courseCode, $batchCode);
+        $batchStmt->execute();
+        $batchRow = $batchStmt->get_result()->fetch_assoc();
+        $batchStmt->close();
+
+        if (!$batchRow) {
+            $errors[] = "Row $lineNo: Course/Batch not found → $courseCode / $batchCode";
+            $skipped++;
+            continue;
+        }
+        $batch_id = (int)$batchRow['id'];
+
+        // Registration number
+        if ($reg === '') {
+            $reg = generateNextReg($conn, $batch_id);
+            if (!$reg) {
+                $errors[] = "Row $lineNo: Could not generate registration number";
+                $skipped++;
+                continue;
+            }
+        }
+
+        // Check duplicate
+        $check = $conn->prepare("SELECT id FROM students WHERE registration_number = ?");
+        $check->bind_param("s", $reg);
+        $check->execute();
+        $check->store_result();
+        if ($check->num_rows > 0) {
+            $check->close();
+            $errors[] = "Row $lineNo: Registration Number already exists → $reg";
+            $skipped++;
+            continue;
+        }
+        $check->close();
+
+        // Insert student
+        try {
+            $stmt = $conn->prepare("INSERT INTO students (registration_number, full_name, phone, phone2, address, batch_id) VALUES (?,?,?,?,?,?)");
+            $stmt->bind_param("sssssi", $reg, $name, $phone, $phone2, $addr, $batch_id);
+            if ($stmt->execute()) {
+                $sid = $stmt->insert_id;
+                $conn->query("INSERT INTO results (student_id, result_status) VALUES ($sid, 'PENDING')");
+                $conn->query("INSERT INTO payments (student_id, payment_status) VALUES ($sid, 'PENDING')");
+                $conn->query("INSERT INTO certificates (student_id, certificate_status) VALUES ($sid, 'PENDING')");
+                $uploaded++;
+            } else {
+                $errors[] = "Row $lineNo ($reg): " . $stmt->error;
+                $skipped++;
+            }
+            $stmt->close();
+        } catch (mysqli_sql_exception $e) {
+            $errors[] = "Row $lineNo ($reg): " . $e->getMessage();
+            $skipped++;
+        }
+    }
+
+    logActivity($admin, 'BULK_UPLOAD_STUDENTS', "Uploaded: $uploaded | Skipped: $skipped");
+
+    $msg = "Bulk upload finished. New students: $uploaded | Skipped: $skipped";
+    if (!empty($errors)) {
+        $msg .= " | Errors: " . count($errors);
+        $_SESSION['upload_errors'] = array_slice($errors, 0, 15);
+    }
+    setFlash('success', $msg);
+    redirect('students.php');
+}
+
+// ============================================
+// SINGLE ADD / EDIT / DELETE (your existing code)
+// ============================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
@@ -158,6 +356,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
+// ============================================
+// FILTERS + DATA FETCH
+// ============================================
 $filterCourse = isset($_GET['course_id']) ? (int)$_GET['course_id'] : 0;
 $filterBatch  = isset($_GET['batch_id']) ? (int)$_GET['batch_id'] : 0;
 $search       = trim($_GET['q'] ?? '');
@@ -194,12 +395,65 @@ $students = $conn->query($sql);
 require_once __DIR__ . '/../includes/header.php';
 ?>
 
-<div class="page-header d-flex justify-content-end align-items-center mb-3">
+<!-- ==================== PAGE HEADER ==================== -->
+<div class="page-header d-flex justify-content-end align-items-center mb-3 gap-2">
+    <button class="btn btn-success" data-bs-toggle="modal" data-bs-target="#uploadModal">
+        <i class="bi bi-file-earmark-excel me-1"></i> Bulk Upload
+    </button>
     <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addModal">
         <i class="bi bi-plus-lg me-1"></i> Add Student
     </button>
 </div>
 
+<!-- ==================== UPLOAD MODAL ==================== -->
+<div class="modal fade" id="uploadModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <form method="POST" enctype="multipart/form-data">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="bi bi-file-earmark-excel"></i> Bulk Upload Students</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" name="action" value="upload">
+                    <div class="mb-3">
+                        <label class="form-label">Select Excel / CSV File</label>
+                        <input type="file" name="excel_file" class="form-control" accept=".xlsx,.xls,.csv" required>
+                        <small class="text-muted">Supported: .xlsx, .xls, .csv • Max recommended: 300 rows</small>
+                    </div>
+                    <div class="alert alert-info mb-0">
+                        <strong>Required columns:</strong><br>
+                        <code>course_code</code>, <code>batch_code</code>, <code>full_name</code><br>
+                        <code>registration_number</code> is optional (auto-generated if empty)
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <a href="Students_Bulk_Upload_Sample.xlsx" class="btn btn-outline-success me-auto" download>
+                        <i class="bi bi-download"></i> Sample Excel
+                    </a>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-success">
+                        <i class="bi bi-upload"></i> Upload & Process
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<?php if (!empty($_SESSION['upload_errors'])): ?>
+<div class="alert alert-warning alert-dismissible fade show">
+    <strong>Some rows had issues:</strong>
+    <ul class="mb-0 mt-1">
+        <?php foreach ($_SESSION['upload_errors'] as $err): ?>
+            <li><?php echo htmlspecialchars($err); ?></li>
+        <?php endforeach; ?>
+    </ul>
+    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+</div>
+<?php unset($_SESSION['upload_errors']); endif; ?>
+
+<!-- ==================== FILTER BAR ==================== -->
 <div class="filter-bar">
     <form method="GET" class="row g-2 align-items-end">
         <div class="col-md-3">
@@ -234,6 +488,7 @@ require_once __DIR__ . '/../includes/header.php';
     </form>
 </div>
 
+<!-- ==================== TABLE ==================== -->
 <div class="card table-card">
     <div class="table-responsive">
         <table class="table table-hover mb-0" id="dataTable">
@@ -283,6 +538,7 @@ require_once __DIR__ . '/../includes/header.php';
                     </td>
                 </tr>
 
+                <!-- Edit Modal -->
                 <div class="modal fade" id="editModal<?php echo $row['id']; ?>" tabindex="-1">
                     <div class="modal-dialog modal-lg">
                         <div class="modal-content">
@@ -344,7 +600,7 @@ require_once __DIR__ . '/../includes/header.php';
     </div>
 </div>
 
-
+<!-- ==================== ADD MODAL ==================== -->
 <div class="modal fade" id="addModal" tabindex="-1">
     <div class="modal-dialog modal-lg">
         <div class="modal-content">
@@ -411,7 +667,6 @@ require_once __DIR__ . '/../includes/header.php';
 </div>
 
 <script>
-
 const allBatches = <?php echo json_encode(array_map(function($b) {
     return [
         'id' => (int)$b['id'],
@@ -488,7 +743,6 @@ if (btnRegen) {
         else alert('Please select Course and Batch first');
     });
 }
-
 
 const addModal = document.getElementById('addModal');
 if (addModal) {
