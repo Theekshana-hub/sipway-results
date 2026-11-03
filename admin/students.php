@@ -301,7 +301,7 @@ while ($b = $batchesList->fetch_assoc()) $batchesArr[] = $b;
 $sql = "
     SELECT s.*, b.batch_code, b.batch_name, c.course_code, c.course_name,
            r.result_status, r.marks_percentage, r.full_marks,
-           p.payment_status, cert.certificate_status
+           p.payment_status, p.amount, cert.certificate_status
     FROM students s
     JOIN batches b ON s.batch_id = b.id
     JOIN courses c ON b.course_id = c.id
@@ -456,7 +456,7 @@ require_once __DIR__ . '/../includes/header.php';
                         ?>
                     </td>
                     <td><?php echo $row['result_status'] ? statusBadge($row['result_status']) : '—'; ?></td>
-                    <td><?php echo $row['payment_status'] ? statusBadge($row['payment_status']) : '—'; ?></td>
+                    <td><?php echo $row['payment_status'] ? statusBadge($row['payment_status']) : '—'; ?><?php if ($row['amount'] !== null && (float)$row['amount'] > 0): ?><br><small class="text-muted">Rs <?php echo number_format((float)$row['amount'], 0); ?></small><?php endif; ?></td>
                     <td><?php echo $row['certificate_status'] ? statusBadge($row['certificate_status']) : '—'; ?></td>
                     <td>
                         <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editModal<?php echo $row['id']; ?>" title="Edit">
