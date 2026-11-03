@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/xlsx_helper.php';
 requireLogin();
 $pageTitle = 'Students';
 $conn = getConnection();
@@ -55,47 +56,13 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'next_reg') {
 }
 
 // ============================================
-// HELPER: Generate next reg number for a batch
-// ============================================
-function generateNextReg($conn, $batch_id) {
-    $info = $conn->query("
-        SELECT c.course_code, b.batch_code
-        FROM batches b
-        JOIN courses c ON b.course_id = c.id
-        WHERE b.id = $batch_id
-    ")->fetch_assoc();
-
-    if (!$info) return null;
-
-    $prefix = $info['course_code'] . '/' . $info['batch_code'] . '/';
-    $like = $conn->real_escape_string($prefix . '%');
-
-    $res = $conn->query("
-        SELECT registration_number FROM students
-        WHERE registration_number LIKE '$like'
-        ORDER BY id DESC
-        LIMIT 50
-    ");
-
-    $maxSeq = 0;
-    if ($res) {
-        while ($r = $res->fetch_assoc()) {
-            if (preg_match('/\/(\d+)$/', $r['registration_number'], $m)) {
-                $seq = (int)$m[1];
-                if ($seq > $maxSeq) $maxSeq = $seq;
-            }
-        }
-    }
-    return $prefix . str_pad($maxSeq + 1, 3, '0', STR_PAD_LEFT);
-}
-
-// ============================================
-// BULK EXCEL / CSV UPLOAD HANDLER
+// BULK UPLOAD  (HDICRA.xlsx  OR  simple CSV/XLSX)
 // ============================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'upload') {
-    $admin = getAdminUsername();
+    $admin    = getAdminUsername();
     $uploaded = 0;
     $skipped  = 0;
+    $dupes    = 0;
     $errors   = [];
 
     if (!isset($_FILES['excel_file']) || $_FILES['excel_file']['error'] !== UPLOAD_ERR_OK) {
@@ -107,148 +74,108 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
     $ext     = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
     $tmpPath = $file['tmp_name'];
 
-    if (!in_array($ext, ['xlsx', 'xls', 'csv'])) {
-        setFlash('error', 'Only .xlsx, .xls or .csv files are allowed.');
+    if (!in_array($ext, ['xlsx', 'csv'])) {
+        setFlash('error', 'Only .xlsx or .csv files are allowed. (For .xls: open it in Excel and Save As .xlsx)');
         redirect('students.php');
     }
 
-    $rows = [];
-
-    // ---------- Read file ----------
+    // ---------- Read file into $allSheets[sheetName] = rows ----------
+    $allSheets = [];
     if ($ext === 'csv') {
-        if (($handle = fopen($tmpPath, 'r')) !== false) {
-            $header = fgetcsv($handle);
-            $header = array_map(function($h) { return strtolower(trim($h)); }, $header);
-            while (($data = fgetcsv($handle)) !== false) {
-                if (count(array_filter($data)) === 0) continue;
-                $rows[] = array_combine($header, $data);
-            }
-            fclose($handle);
-        }
+        $rows = [];
+        $h = fopen($tmpPath, 'r');
+        $bom = fread($h, 3);
+        if ($bom !== "\xEF\xBB\xBF") rewind($h);
+        while (($d = fgetcsv($h)) !== false) $rows[] = $d;
+        fclose($h);
+        $allSheets['CSV'] = $rows;
     } else {
-        require_once __DIR__ . '/../vendor/autoload.php';
-
-        try {
-            $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($tmpPath);
-            $sheet = $spreadsheet->getActiveSheet();
-            $data  = $sheet->toArray(null, true, true, true);
-
-            $headerRow = array_shift($data);
-            $header = [];
-            foreach ($headerRow as $col => $val) {
-                $header[$col] = strtolower(trim((string)$val));
-            }
-
-            foreach ($data as $row) {
-                if (count(array_filter($row)) === 0) continue;
-                $combined = [];
-                foreach ($header as $col => $key) {
-                    $combined[$key] = isset($row[$col]) ? trim((string)$row[$col]) : '';
-                }
-                $rows[] = $combined;
-            }
-        } catch (Exception $e) {
-            setFlash('error', 'Failed to read Excel file: ' . $e->getMessage());
+        $allSheets = readXlsxAllSheets($tmpPath);
+        if (empty($allSheets)) {
+            setFlash('error', 'Could not read the Excel file. Try Save As → CSV UTF-8.');
             redirect('students.php');
         }
     }
 
-    // ---------- Process each row ----------
-    foreach ($rows as $index => $row) {
-        $lineNo = $index + 2;
+    // ---------- Process every sheet ----------
+    foreach ($allSheets as $sheetName => $rows) {
+        if (empty($rows)) continue;
 
-        $reg        = trim($row['registration_number'] ?? $row['reg_number'] ?? $row['reg'] ?? '');
-        $courseCode = trim($row['course_code'] ?? $row['course'] ?? '');
-        $batchCode  = trim($row['batch_code'] ?? $row['batch'] ?? '');
-        $name       = trim($row['full_name'] ?? $row['name'] ?? '');
-        $phone      = trim($row['phone'] ?? '');
-        $phone2     = trim($row['phone2'] ?? $row['phone_2'] ?? '');
-        $addr       = trim($row['address'] ?? '');
-
-        // Validation
-        if ($name === '' || $courseCode === '' || $batchCode === '') {
-            $errors[] = "Row $lineNo: Missing required fields (course_code / batch_code / full_name)";
-            $skipped++;
+        $map = detectStudentColumns($rows);
+        if ($map['header_row'] === null) {
+            $errors[] = "$sheetName: header row not recognised — sheet skipped (need 'Reg No' + 'Name', or course_code + batch_code + full_name)";
             continue;
         }
 
-        // Find batch_id
-        $batchStmt = $conn->prepare("
-            SELECT b.id 
-            FROM batches b 
-            JOIN courses c ON b.course_id = c.id 
-            WHERE c.course_code = ? AND b.batch_code = ? AND b.is_active = 1
-            LIMIT 1
-        ");
-        $batchStmt->bind_param("ss", $courseCode, $batchCode);
-        $batchStmt->execute();
-        $batchRow = $batchStmt->get_result()->fetch_assoc();
-        $batchStmt->close();
+        for ($r = $map['header_row'] + 1; $r < count($rows); $r++) {
+            $row    = $rows[$r];
+            $lineNo = $r + 1;
 
-        if (!$batchRow) {
-            $errors[] = "Row $lineNo: Course/Batch not found → $courseCode / $batchCode";
-            $skipped++;
-            continue;
-        }
-        $batch_id = (int)$batchRow['id'];
+            $reg    = cellVal($row, $map['reg']);
+            $name   = cellVal($row, $map['name']);
+            $phone  = cellVal($row, $map['phone']);
+            $phone2 = cellVal($row, $map['phone2']);
+            $addr   = cellVal($row, $map['address']);
+            $course = cellVal($row, $map['course']);
+            $batch  = cellVal($row, $map['batch']);
 
-        // Registration number
-        if ($reg === '') {
-            $reg = generateNextReg($conn, $batch_id);
-            if (!$reg) {
-                $errors[] = "Row $lineNo: Could not generate registration number";
+            // HDICRA Batch-08 style: real reg no may be in col 0 / col 1
+            if ($reg !== '' && !isRegNo($reg) && $map['course'] === null) {
+                $c0 = cellVal($row, 0);
+                $c1 = cellVal($row, 1);
+                if (isRegNo($c0))      $reg = $c0;
+                elseif (isRegNo($c1))  $reg = $c1;
+            }
+
+            // completely empty row
+            if ($reg === '' && $name === '' && $course === '' && $batch === '') continue;
+
+            // HDICRA sheets contain junk rows (totals, notes) → skip rows without a valid Reg No
+            if ($map['course'] === null && !isRegNo($reg)) continue;
+
+            // Excel may give phone as float (771234567.0)
+            foreach (['phone', 'phone2'] as $pv) {
+                if (is_numeric($$pv) && strpos($$pv, '.') !== false) $$pv = (string)(int)(float)$$pv;
+            }
+
+            // Validation for simple CSV format
+            if ($name === '') {
+                $errors[] = "$sheetName Row $lineNo: Missing full_name";
                 $skipped++;
                 continue;
             }
-        }
+            if (($course === '' || $batch === '') && !isRegNo($reg)) {
+                $errors[] = "$sheetName Row $lineNo: Missing course_code / batch_code (and Reg No is not like ICRA/B01/001)";
+                $skipped++;
+                continue;
+            }
 
-        // Check duplicate
-        $check = $conn->prepare("SELECT id FROM students WHERE registration_number = ?");
-        $check->bind_param("s", $reg);
-        $check->execute();
-        $check->store_result();
-        if ($check->num_rows > 0) {
-            $check->close();
-            $errors[] = "Row $lineNo: Registration Number already exists → $reg";
-            $skipped++;
-            continue;
-        }
-        $check->close();
-
-        // Insert student
-        try {
-            $stmt = $conn->prepare("INSERT INTO students (registration_number, full_name, phone, phone2, address, batch_id) VALUES (?,?,?,?,?,?)");
-            $stmt->bind_param("sssssi", $reg, $name, $phone, $phone2, $addr, $batch_id);
-            if ($stmt->execute()) {
-                $sid = $stmt->insert_id;
-                $conn->query("INSERT INTO results (student_id, result_status) VALUES ($sid, 'PENDING')");
-                $conn->query("INSERT INTO payments (student_id, payment_status) VALUES ($sid, 'PENDING')");
-                $conn->query("INSERT INTO certificates (student_id, certificate_status) VALUES ($sid, 'PENDING')");
+            $res = importOneStudent($conn, $reg, $name, $phone, $course, $batch, $phone2, $addr);
+            if ($res === 'new') {
                 $uploaded++;
+            } elseif ($res === 'exists') {
+                $dupes++;
+                $skipped++;
             } else {
-                $errors[] = "Row $lineNo ($reg): " . $stmt->error;
+                $errors[] = "$sheetName Row $lineNo ($reg): $res";
                 $skipped++;
             }
-            $stmt->close();
-        } catch (mysqli_sql_exception $e) {
-            $errors[] = "Row $lineNo ($reg): " . $e->getMessage();
-            $skipped++;
         }
     }
 
-    logActivity($admin, 'BULK_UPLOAD_STUDENTS', "Uploaded: $uploaded | Skipped: $skipped");
+    logActivity($admin, 'BULK_UPLOAD_STUDENTS', "Uploaded: $uploaded | Already existed: $dupes | Skipped: $skipped");
 
-    $msg = "Bulk upload finished. New students: $uploaded | Skipped: $skipped";
+    $msg = "Bulk upload finished. New students: $uploaded | Already existed: $dupes | Skipped: $skipped";
     if (!empty($errors)) {
         $msg .= " | Errors: " . count($errors);
-        $_SESSION['upload_errors'] = array_slice($errors, 0, 15);
+        $_SESSION['upload_errors'] = array_slice($errors, 0, 20);
     }
     setFlash('success', $msg);
     redirect('students.php');
 }
 
 // ============================================
-// SINGLE ADD / EDIT / DELETE (your existing code)
+// SINGLE ADD / EDIT / DELETE
 // ============================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
@@ -418,13 +345,18 @@ require_once __DIR__ . '/../includes/header.php';
                     <input type="hidden" name="action" value="upload">
                     <div class="mb-3">
                         <label class="form-label">Select Excel / CSV File</label>
-                        <input type="file" name="excel_file" class="form-control" accept=".xlsx,.xls,.csv" required>
-                        <small class="text-muted">Supported: .xlsx, .xls, .csv • Max recommended: 300 rows</small>
+                        <input type="file" name="excel_file" class="form-control" accept=".xlsx,.csv" required>
+                        <small class="text-muted">Supported: .xlsx, .csv (all sheets are read)</small>
                     </div>
-                    <div class="alert alert-info mb-0">
-                        <strong>Required columns:</strong><br>
-                        <code>course_code</code>, <code>batch_code</code>, <code>full_name</code><br>
-                        <code>registration_number</code> is optional (auto-generated if empty)
+                    <div class="alert alert-info mb-0 small">
+                        <strong>2 formats accepted:</strong>
+                        <ol class="mb-0 ps-3 mt-1">
+                            <li><strong>HDICRA.xlsx</strong> (Batch 01, Batch 02 ... sheets) — columns <code>Reg No</code>, <code>Name</code>, <code>WhatsApp</code>.
+                                Course &amp; batch are taken from the Reg No (e.g. <code>ICRA/B01/001</code>); missing course/batch are created automatically.</li>
+                            <li><strong>Simple file</strong> — <code>course_code</code>, <code>batch_code</code>, <code>full_name</code>
+                                (optional: <code>registration_number</code>, <code>phone</code>, <code>phone2</code>, <code>address</code>).
+                                Empty registration number = auto-generated.</li>
+                        </ol>
                     </div>
                 </div>
                 <div class="modal-footer">
@@ -433,7 +365,7 @@ require_once __DIR__ . '/../includes/header.php';
                     </a>
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                     <button type="submit" class="btn btn-success">
-                        <i class="bi bi-upload"></i> Upload & Process
+                        <i class="bi bi-upload"></i> Upload &amp; Process
                     </button>
                 </div>
             </form>
