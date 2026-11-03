@@ -5,7 +5,7 @@ requireLogin();
 $pageTitle = 'Payments';
 $conn = getConnection();
 
-// ---- make sure the extra amount columns exist (auto-added once) ----
+// Extra amount columns
 $hasExtra = false;
 try {
     $chk = $conn->query("SHOW COLUMNS FROM payments LIKE 'reg_fee'");
@@ -20,22 +20,14 @@ try {
     $hasExtra = ($chk && $chk->num_rows > 0);
 } catch (Throwable $e) { $hasExtra = false; }
 
-// ============================================================
-// SETTINGS  (change here if you want different status names)
-// ============================================================
-const PAY_FULL_STATUS     = 'COMPLETED';   // all course fee paid
-const PAY_ONETIME_STATUS  = 'ONE_TIME';    // paid in one-time offer (Offer column says "one time")
-const PAY_PARTIAL_STATUS  = 'PENDING';     // some installments paid, balance remaining
-const PAY_NONE_STATUS     = 'NOT_PAID';    // only registration fee paid / no course fee yet
-const DEFAULT_FEE_OLD     = 30000;         // Batch 01-03 course fee (when Excel cell is empty)
-const DEFAULT_FEE_NEW     = 32000;         // Batch 04+  course fee (when Excel cell is empty)
-const MAX_SINGLE_PAYMENT  = 40000;         // numbers above this in fee cells are ignored (they are dates / junk)
+const PAY_FULL_STATUS     = 'COMPLETED';
+const PAY_ONETIME_STATUS  = 'ONE_TIME';
+const PAY_PARTIAL_STATUS  = 'PENDING';
+const PAY_NONE_STATUS     = 'NOT_PAID';
+const DEFAULT_FEE_OLD     = 30000;
+const DEFAULT_FEE_NEW     = 32000;
+const MAX_SINGLE_PAYMENT  = 40000;
 
-// ============================================================
-// HELPERS
-// ============================================================
-
-/** Certificate status follows result + payment */
 function refreshCertificate($conn, $student_id, $payStatus) {
     $student_id = (int)$student_id;
     $res = $conn->query("SELECT result_status, full_marks, marks_percentage FROM results WHERE student_id=$student_id")->fetch_assoc();
@@ -54,7 +46,7 @@ function refreshCertificate($conn, $student_id, $payStatus) {
 function parsePayDate($v) {
     $v = trim((string)$v);
     if ($v === '') return null;
-    if (is_numeric($v)) {                                   // Excel serial date
+    if (is_numeric($v)) {
         $f = (float)$v;
         return ($f > 30000 && $f < 80000) ? gmdate('Y-m-d', (int)(($f - 25569) * 86400)) : null;
     }
@@ -62,7 +54,6 @@ function parsePayDate($v) {
     return ($t && $t > strtotime('2020-01-01') && $t < strtotime('2035-01-01')) ? date('Y-m-d', $t) : null;
 }
 
-/** A real money amount (numeric, >0, not a date serial) or null */
 function payNum($v) {
     $v = trim((string)$v);
     if ($v === '' || !is_numeric($v)) return null;
@@ -70,22 +61,14 @@ function payNum($v) {
     return ($f > 0 && $f <= MAX_SINGLE_PAYMENT) ? $f : null;
 }
 
-function colLetterP($i) {   // 0-based index -> A, B, ... AA
-    $s = '';
-    $i++;
+function colLetterP($i) {
+    $s = ''; $i++;
     while ($i > 0) { $m = ($i - 1) % 26; $s = chr(65 + $m) . $s; $i = intdiv($i - $m - 1, 26); }
     return $s;
 }
 
 function moneyFmt($n) { return number_format((float)$n, 0, '.', ','); }
 
-/**
- * Find the header (2 rows) of a batch sheet and the payment column groups.
- * Layout in HDICRA.xlsx:
- *   Registration Fee : Amount | Bank | Ref No | Date | Coordinator | Payment Month | Remark
- *   Course Fee / Offer
- *   Installments     : <Fee col> | Bank | Ref No | Date | Coordinator | Payment Month   (x6)
- */
 function detectPaymentLayout($rows) {
     $hr = null;
     for ($r = 0; $r < min(30, count($rows)); $r++) {
@@ -98,13 +81,11 @@ function detectPaymentLayout($rows) {
 
     $rowA = $rows[$hr];
     $rowB = $rows[$hr + 1];
-
     $stop = count($rowB);
     foreach ($rowB as $i => $v) {
         if (strpos(normalizeHeader($v), 'batch transfer') !== false) { $stop = $i; break; }
     }
-
-    $groups = [];   // columns whose NEXT column is "Bank"
+    $groups = [];
     for ($i = 0; $i < $stop; $i++) {
         if (isset($rowB[$i + 1]) && normalizeHeader($rowB[$i + 1]) === 'bank') $groups[] = $i;
     }
@@ -117,13 +98,11 @@ function detectPaymentLayout($rows) {
     foreach ($rowA as $i => $v) {
         $h = normalizeHeader($v);
         if ($h === 'course fee' && $courseCol === null) $courseCol = $i;
-        if ($h === 'offer' && $offerCol === null)       $offerCol = $i;
+        if ($h === 'offer' && $offerCol === null) $offerCol = $i;
     }
-
     return ['header_row' => $hr, 'regfee' => $regFee, 'inst' => $groups, 'course' => $courseCol, 'offer' => $offerCol, 'rowB' => $rowB];
 }
 
-/** Read the existing manual part of notes (the part after " ## ") */
 function manualNotesPart($existing) {
     $existing = (string)$existing;
     if ($existing === '') return '';
@@ -131,12 +110,10 @@ function manualNotesPart($existing) {
         $p = strpos($existing, ' ## ');
         return $p === false ? '' : substr($existing, $p + 4);
     }
-    return $existing;   // a note somebody typed by hand
+    return $existing;
 }
 
-// ============================================================
-// EXCEL / CSV UPLOAD  →  PAYMENTS
-// ============================================================
+// ========== EXCEL UPLOAD ==========
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'upload') {
     $admin = getAdminUsername();
     $stats = ['sheets' => 0, 'students' => 0, 'completed' => 0, 'one_time' => 0, 'partial' => 0, 'none' => 0, 'notfound' => 0, 'nodata' => 0, 'failed' => 0];
@@ -168,15 +145,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
         $stats['sheets']++;
         $letters = array_map('colLetterP', $lay['inst']);
         $notes[] = "$sheetName → header row " . ($lay['header_row'] + 1)
-                 . " | Reg fee col: " . ($lay['regfee'] !== null ? colLetterP($lay['regfee']) : '—')
-                 . " | Installment cols: " . implode(', ', $letters)
-                 . " | Course fee col: " . ($lay['course'] !== null ? colLetterP($lay['course']) : '—')
-                 . " | Offer col: " . ($lay['offer'] !== null ? colLetterP($lay['offer']) : '—');
+                 . " | Reg fee: " . ($lay['regfee'] !== null ? colLetterP($lay['regfee']) : '—')
+                 . " | Installments: " . implode(', ', $letters);
 
         for ($r = $lay['header_row'] + 2; $r < count($rows); $r++) {
             $row = $rows[$r];
-
-            // Reg No is in col A (Batch 06-08) or col B (others)
             $reg = '';
             foreach ([0, 1, 2] as $ci) {
                 $v = cellVal($row, $ci);
@@ -184,7 +157,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
             }
             if ($reg === '') continue;
 
-            // ---- student ----
             $st = $conn->prepare("SELECT id FROM students WHERE registration_number = ? LIMIT 1");
             $st->bind_param("s", $reg);
             $st->execute();
@@ -192,12 +164,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
             $st->close();
             if (!$stu) {
                 $stats['notfound']++;
-                if (count($notes) < 45) $notes[] = "$sheetName Row " . ($r + 1) . ": student not found → $reg (upload students first)";
+                if (count($notes) < 45) $notes[] = "$sheetName: student not found → $reg";
                 continue;
             }
             $sid = (int)$stu['id'];
 
-            // ---- registration fee ----
             $regFee = 0.0; $dates = [];
             if ($lay['regfee'] !== null) {
                 $a = payNum(cellVal($row, $lay['regfee']));
@@ -208,7 +179,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
                 }
             }
 
-            // ---- installments ----
             $inst = []; $instSum = 0.0; $paidMarkers = 0;
             foreach ($lay['inst'] as $k => $ci) {
                 $raw = cellVal($row, $ci);
@@ -219,11 +189,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
                     $d = parsePayDate(cellVal($row, $ci + 3));
                     if ($d) $dates[] = $d;
                 } elseif (strtolower(trim($raw)) === 'paid') {
-                    $paidMarkers++;            // cell just says "PAID" (one-time payers)
+                    $paidMarkers++;
                 }
             }
 
-            // ---- how much should the student pay? ----
             $batchNo = preg_match('/^[A-Za-z]+\/[A-Za-z]*0*(\d+)\//', $reg, $bm) ? (int)$bm[1] : 99;
             $due = ($batchNo <= 3) ? DEFAULT_FEE_OLD : DEFAULT_FEE_NEW;
             if ($lay['course'] !== null) {
@@ -248,14 +217,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
             }
 
             $coursePaid = $instSum;
-            if ($coursePaid == 0 && $paidMarkers > 0) $coursePaid = $due;   // only "PAID" text
+            if ($coursePaid == 0 && $paidMarkers > 0) $coursePaid = $due;
+            if ($regFee == 0 && $coursePaid == 0) { $stats['nodata']++; continue; }
 
-            if ($regFee == 0 && $coursePaid == 0) {   // nothing paid yet
-                $stats['nodata']++;
-                continue;
-            }
-
-            // ---- status ----
             if ($coursePaid + 0.01 >= $due) {
                 $status = ($plan === 'One time') ? PAY_ONETIME_STATUS : PAY_FULL_STATUS;
                 $stats[$plan === 'One time' ? 'one_time' : 'completed']++;
@@ -267,9 +231,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
                 $stats['none']++;
             }
 
-            $total    = $regFee + $coursePaid;
+            $total = $regFee + $coursePaid;
             $lastDate = $dates ? max($dates) : null;
-            $balance  = max(0, $due - $coursePaid);
+            $balance = max(0, $due - $coursePaid);
 
             $parts = [];
             if ($regFee > 0) $parts[] = 'Reg fee ' . moneyFmt($regFee);
@@ -278,14 +242,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
             if ($inst) $parts[] = 'Installments: ' . implode(', ', $inst);
             $excelNote = '[Excel] ' . implode(' | ', $parts);
 
-            // ---- save ----
             $ex = $conn->query("SELECT payment_status, notes FROM payments WHERE student_id=$sid LIMIT 1")->fetch_assoc();
-            if ($ex && $ex['payment_status'] === 'CONVA_PAY') $status = 'CONVA_PAY';   // keep manual Conva Pay
+            if ($ex && $ex['payment_status'] === 'CONVA_PAY') $status = 'CONVA_PAY';
             $manual = manualNotesPart($ex['notes'] ?? '');
             $finalNotes = $manual !== '' ? $excelNote . ' ## ' . $manual : $excelNote;
-            $total = (float)$total;
 
-            $regF = (float)$regFee; $cPaid = (float)$coursePaid; $cDue = (float)$due; $bal = (float)$balance;
+            $regF = (float)$regFee; $cPaid = (float)$coursePaid; $cDue = (float)$due; $bal = (float)$balance; $total = (float)$total;
             if ($ex) {
                 if ($hasExtra) {
                     $stmt = $conn->prepare("UPDATE payments SET payment_status=?, amount=?, payment_date=?, notes=?, updated_by=?, reg_fee=?, course_paid=?, course_due=?, balance=? WHERE student_id=?");
@@ -308,56 +270,73 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
                 refreshCertificate($conn, $sid, $status);
             } else {
                 $stats['failed']++;
-                if (count($notes) < 45) $notes[] = "$reg: " . $stmt->error;
             }
             $stmt->close();
         }
     }
 
-    $sum = $conn->query("SELECT COUNT(*) AS n, COALESCE(SUM(amount),0) AS t FROM payments WHERE amount IS NOT NULL AND amount > 0")->fetch_assoc();
-    $stats['saved_rows'] = (int)$sum['n'];
     logActivity($admin, 'PAYMENT_UPLOAD', json_encode($stats));
-    setFlash('success',
-        "Payments imported. Students updated: {$stats['students']} | Completed: {$stats['completed']} | One time: {$stats['one_time']} | "
-        . "Partial: {$stats['partial']} | Only reg fee: {$stats['none']} | No payments in Excel: {$stats['nodata']} | Student not found: {$stats['notfound']} | Payments with amount in system: {$sum['n']} (Rs " . number_format((float)$sum['t'], 0) . ")");
+    setFlash('success', "Payments imported. Updated: {$stats['students']} | Completed: {$stats['completed']} | One time: {$stats['one_time']} | Partial: {$stats['partial']} | Not found: {$stats['notfound']}");
     if ($notes) $_SESSION['upload_errors'] = array_slice($notes, 0, 45);
     redirect('payments.php');
 }
 
-// ============================================================
-// SINGLE UPDATE
-// ============================================================
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = $_POST['action'] ?? '';
-    if ($action === 'update') {
-        $student_id = (int)$_POST['student_id'];
-        $status = $_POST['payment_status'] ?? 'PENDING';
-        $amount = $_POST['amount'] !== '' ? (float)$_POST['amount'] : null;
-        $pdate  = $_POST['payment_date'] !== '' ? $_POST['payment_date'] : null;
-        $notes  = trim($_POST['notes'] ?? '');
-        $admin  = getAdminUsername();
+// ========== SINGLE UPDATE (all fields editable) ==========
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'update') {
+    $student_id = (int)$_POST['student_id'];
+    $status = $_POST['payment_status'] ?? 'PENDING';
+    $reg_fee = $_POST['reg_fee'] !== '' ? (float)$_POST['reg_fee'] : null;
+    $course_paid = $_POST['course_paid'] !== '' ? (float)$_POST['course_paid'] : null;
+    $course_due = $_POST['course_due'] !== '' ? (float)$_POST['course_due'] : null;
+    $balance = $_POST['balance'] !== '' ? (float)$_POST['balance'] : null;
+    $amount = $_POST['amount'] !== '' ? (float)$_POST['amount'] : null;
+    $pdate = $_POST['payment_date'] !== '' ? $_POST['payment_date'] : null;
+    $notes = trim($_POST['notes'] ?? '');
+    $admin = getAdminUsername();
 
-        $check = $conn->query("SELECT id FROM payments WHERE student_id=$student_id");
-        if ($check->num_rows > 0) {
+    // Auto calc total if empty but parts given
+    if ($amount === null && ($reg_fee !== null || $course_paid !== null)) {
+        $amount = (float)($reg_fee ?? 0) + (float)($course_paid ?? 0);
+    }
+    // Auto calc balance if empty
+    if ($balance === null && $course_due !== null && $course_paid !== null) {
+        $balance = max(0, $course_due - $course_paid);
+    }
+
+    $check = $conn->query("SELECT id FROM payments WHERE student_id=$student_id");
+    if ($check && $check->num_rows > 0) {
+        if ($hasExtra) {
+            $stmt = $conn->prepare("UPDATE payments SET payment_status=?, amount=?, payment_date=?, notes=?, updated_by=?, reg_fee=?, course_paid=?, course_due=?, balance=? WHERE student_id=?");
+            $stmt->bind_param("sdsssddddi", $status, $amount, $pdate, $notes, $admin, $reg_fee, $course_paid, $course_due, $balance, $student_id);
+        } else {
             $stmt = $conn->prepare("UPDATE payments SET payment_status=?, amount=?, payment_date=?, notes=?, updated_by=? WHERE student_id=?");
             $stmt->bind_param("sdsssi", $status, $amount, $pdate, $notes, $admin, $student_id);
+        }
+    } else {
+        if ($hasExtra) {
+            $stmt = $conn->prepare("INSERT INTO payments (student_id, payment_status, amount, payment_date, notes, updated_by, reg_fee, course_paid, course_due, balance) VALUES (?,?,?,?,?,?,?,?,?,?)");
+            $stmt->bind_param("isdsssdddd", $student_id, $status, $amount, $pdate, $notes, $admin, $reg_fee, $course_paid, $course_due, $balance);
         } else {
             $stmt = $conn->prepare("INSERT INTO payments (student_id, payment_status, amount, payment_date, notes, updated_by) VALUES (?,?,?,?,?,?)");
             $stmt->bind_param("isdsss", $student_id, $status, $amount, $pdate, $notes, $admin);
         }
-        if ($stmt->execute()) {
-            refreshCertificate($conn, $student_id, $status);
-            logActivity($admin, 'UPDATE_PAYMENT', "Student:$student_id Status:$status");
-            setFlash('success', 'Payment updated.');
-        }
-        $stmt->close();
-        redirect('payments.php');
     }
+    if ($stmt->execute()) {
+        refreshCertificate($conn, $student_id, $status);
+        logActivity($admin, 'UPDATE_PAYMENT', "Student:$student_id Status:$status");
+        setFlash('success', 'Payment updated successfully.');
+    } else {
+        setFlash('error', 'Error: ' . $stmt->error);
+    }
+    $stmt->close();
+    redirect('payments.php?' . http_build_query(array_filter([
+        'status' => $_POST['redirect_status'] ?? '',
+        'batch_id' => $_POST['redirect_batch'] ?? '',
+        'q' => $_POST['redirect_q'] ?? ''
+    ])));
 }
 
-// ============================================================
-// LIST
-// ============================================================
+// ========== LIST ==========
 $filterStatus = $_GET['status'] ?? '';
 $filterBatch  = isset($_GET['batch_id']) ? (int)$_GET['batch_id'] : 0;
 $search = trim($_GET['q'] ?? '');
@@ -369,7 +348,8 @@ while ($b = $q->fetch_assoc()) $batchesArr[] = $b;
 $sql = "
     SELECT s.id AS student_id, s.registration_number, s.full_name, s.phone,
            b.batch_code, c.course_code,
-           p.payment_status, p.amount, p.payment_date, p.notes" . ($hasExtra ? ", p.reg_fee, p.course_paid, p.course_due, p.balance" : ", NULL AS reg_fee, NULL AS course_paid, NULL AS course_due, NULL AS balance") . "
+           p.payment_status, p.amount, p.payment_date, p.notes" .
+           ($hasExtra ? ", p.reg_fee, p.course_paid, p.course_due, p.balance" : ", NULL AS reg_fee, NULL AS course_paid, NULL AS course_due, NULL AS balance") . "
     FROM students s
     JOIN batches b ON s.batch_id = b.id
     JOIN courses c ON b.course_id = c.id
@@ -416,7 +396,6 @@ require_once __DIR__ . '/../includes/header.php';
 </div>
 <?php unset($_SESSION['upload_errors']); endif; ?>
 
-<!-- Upload modal -->
 <div class="modal fade" id="payUploadModal" tabindex="-1">
     <div class="modal-dialog modal-lg">
         <div class="modal-content">
@@ -427,27 +406,9 @@ require_once __DIR__ . '/../includes/header.php';
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body">
-                    <label class="form-label">HDICRA.xlsx (all Batch sheets)</label>
+                    <label class="form-label">HDICRA.xlsx</label>
                     <input type="file" name="excel_file" class="form-control" accept=".xlsx" required>
-                    <div class="alert alert-info small mt-3 mb-0">
-                        <strong>How it works</strong>
-                        <ul class="mb-2 ps-3">
-                            <li>Students are matched by <strong>Reg No</strong> (upload students first).</li>
-                            <li>Reads <strong>Registration Fee</strong> + all <strong>installment fee columns</strong> (1st … 6th) of every sheet.</li>
-                            <li><strong>Amount</strong> = total received (reg fee + installments). <strong>Date</strong> = last payment date.
-                                <strong>Notes</strong> = breakdown + balance (kept separate from your own notes).</li>
-                            <li>Course fee comes from the <em>Course Fee</em> / <em>Offer</em> columns (e.g. "25000 (one time)").</li>
-                        </ul>
-                        <strong>Status rules</strong>
-                        <table class="table table-sm table-bordered mb-0 bg-white">
-                            <tr><td>Paid full course fee</td><td><span class="badge bg-success">COMPLETED</span></td></tr>
-                            <tr><td>Paid in the one-time offer</td><td><span class="badge bg-success">ONE TIME</span></td></tr>
-                            <tr><td>Some installments paid, balance left</td><td><span class="badge bg-warning text-dark">PENDING</span></td></tr>
-                            <tr><td>Only registration fee paid</td><td><span class="badge bg-danger">NOT PAID</span></td></tr>
-                            <tr><td>Nothing in Excel</td><td>unchanged</td></tr>
-                        </table>
-                        <div class="mt-2">Students marked <strong>CONVA PAY</strong> manually keep that status.</div>
-                    </div>
+                    <small class="text-muted">Students must be uploaded first. Reads Registration Fee + all installments.</small>
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -536,17 +497,21 @@ require_once __DIR__ . '/../includes/header.php';
                 </tr>
 
                 <div class="modal fade" id="payModal<?php echo $row['student_id']; ?>" tabindex="-1">
-                    <div class="modal-dialog">
+                    <div class="modal-dialog modal-lg">
                         <div class="modal-content">
-                            <form method="POST">
+                            <form method="POST" class="pay-edit-form">
                                 <div class="modal-header">
-                                    <h5 class="modal-title">Update Payment — <?php echo sanitize($row['registration_number']); ?></h5>
+                                    <h5 class="modal-title">Edit Payment — <?php echo sanitize($row['registration_number']); ?></h5>
                                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                                 </div>
                                 <div class="modal-body">
                                     <input type="hidden" name="action" value="update">
                                     <input type="hidden" name="student_id" value="<?php echo $row['student_id']; ?>">
-                                    <p class="text-muted"><?php echo sanitize($row['full_name']); ?></p>
+                                    <input type="hidden" name="redirect_status" value="<?php echo sanitize($filterStatus); ?>">
+                                    <input type="hidden" name="redirect_batch" value="<?php echo $filterBatch; ?>">
+                                    <input type="hidden" name="redirect_q" value="<?php echo sanitize($search); ?>">
+                                    <p class="text-muted mb-3"><?php echo sanitize($row['full_name']); ?> | <?php echo sanitize($row['course_code'].'/'.$row['batch_code']); ?></p>
+
                                     <div class="mb-3">
                                         <label class="form-label">Payment Status *</label>
                                         <select name="payment_status" class="form-select" required>
@@ -555,24 +520,44 @@ require_once __DIR__ . '/../includes/header.php';
                                             <?php endforeach; ?>
                                         </select>
                                     </div>
-                                    <div class="row g-3">
-                                        <div class="col-6">
-                                            <label class="form-label">Amount</label>
-                                            <input type="number" step="0.01" name="amount" class="form-control" value="<?php echo $row['amount'] ?? ''; ?>">
+
+                                    <div class="row g-3 mb-3">
+                                        <div class="col-md-4">
+                                            <label class="form-label">Registration Fee</label>
+                                            <input type="number" step="0.01" name="reg_fee" class="form-control calc-field" value="<?php echo $row['reg_fee'] ?? ''; ?>" placeholder="0">
                                         </div>
-                                        <div class="col-6">
-                                            <label class="form-label">Payment Date</label>
+                                        <div class="col-md-4">
+                                            <label class="form-label">Course Paid</label>
+                                            <input type="number" step="0.01" name="course_paid" class="form-control calc-field" value="<?php echo $row['course_paid'] ?? ''; ?>" placeholder="0">
+                                        </div>
+                                        <div class="col-md-4">
+                                            <label class="form-label">Course Due (full fee)</label>
+                                            <input type="number" step="0.01" name="course_due" class="form-control calc-field" value="<?php echo $row['course_due'] ?? ''; ?>" placeholder="30000">
+                                        </div>
+                                        <div class="col-md-4">
+                                            <label class="form-label">Balance</label>
+                                            <input type="number" step="0.01" name="balance" class="form-control balance-field" value="<?php echo $row['balance'] ?? ''; ?>" placeholder="auto">
+                                            <small class="text-muted">Auto = Due − Paid</small>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <label class="form-label">Total Amount</label>
+                                            <input type="number" step="0.01" name="amount" class="form-control total-field" value="<?php echo $row['amount'] ?? ''; ?>" placeholder="auto">
+                                            <small class="text-muted">Auto = Reg + Course Paid</small>
+                                        </div>
+                                        <div class="col-md-4">
+                                            <label class="form-label">Last Payment Date</label>
                                             <input type="date" name="payment_date" class="form-control" value="<?php echo $row['payment_date'] ?? ''; ?>">
                                         </div>
                                     </div>
-                                    <div class="mb-3 mt-3">
+
+                                    <div class="mb-3">
                                         <label class="form-label">Notes</label>
                                         <textarea name="notes" class="form-control" rows="3"><?php echo sanitize($row['notes'] ?? ''); ?></textarea>
                                     </div>
                                 </div>
                                 <div class="modal-footer">
                                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                                    <button type="submit" class="btn btn-primary">Save</button>
+                                    <button type="submit" class="btn btn-primary">Save Payment</button>
                                 </div>
                             </form>
                         </div>
@@ -585,5 +570,30 @@ require_once __DIR__ . '/../includes/header.php';
         </table>
     </div>
 </div>
+
+<script>
+document.querySelectorAll('.pay-edit-form').forEach(function(form) {
+    function recalc() {
+        const reg = parseFloat(form.querySelector('[name=reg_fee]').value) || 0;
+        const paid = parseFloat(form.querySelector('[name=course_paid]').value) || 0;
+        const due = parseFloat(form.querySelector('[name=course_due]').value) || 0;
+        const totalField = form.querySelector('.total-field');
+        const balField = form.querySelector('.balance-field');
+        if (totalField && !totalField.dataset.manual) {
+            totalField.value = (reg + paid).toFixed(2);
+        }
+        if (balField && !balField.dataset.manual && due > 0) {
+            balField.value = Math.max(0, due - paid).toFixed(2);
+        }
+    }
+    form.querySelectorAll('.calc-field').forEach(function(inp) {
+        inp.addEventListener('input', recalc);
+    });
+    const totalField = form.querySelector('.total-field');
+    const balField = form.querySelector('.balance-field');
+    if (totalField) totalField.addEventListener('input', function(){ this.dataset.manual = '1'; });
+    if (balField) balField.addEventListener('input', function(){ this.dataset.manual = '1'; });
+});
+</script>
 
 <?php require_once __DIR__ . '/../includes/footer.php'; ?>
