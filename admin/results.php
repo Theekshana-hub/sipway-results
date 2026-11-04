@@ -1,240 +1,70 @@
 <?php
 require_once __DIR__ . '/../includes/auth.php';
+require_once __DIR__ . '/../includes/xlsx_helper.php';
+require_once __DIR__ . '/../includes/payment_import.php';   // NEW: payment importer (shared with payments.php)
 requireLogin();
 $pageTitle = 'Results';
 $conn = getConnection();
 
-/**
- * Lightweight multi-sheet XLSX reader (no Composer needed)
- * Returns: [ 'SheetName' => [ [col0, col1, ...], ... ], ... ]
- */
-function readXlsxAllSheets($path) {
-    $result = [];
-    if (!class_exists('ZipArchive')) return $result;
-    $zip = new ZipArchive();
-    if ($zip->open($path) !== true) return $result;
 
-    // Shared strings
-    $shared = [];
-    $ssXml = $zip->getFromName('xl/sharedStrings.xml');
-    if ($ssXml) {
-        $sx = @simplexml_load_string($ssXml);
-        if ($sx) {
-            foreach ($sx->si as $si) {
-                if (isset($si->t)) {
-                    $shared[] = (string)$si->t;
-                } else {
-                    $t = '';
-                    if (isset($si->r)) {
-                        foreach ($si->r as $r) $t .= (string)$r->t;
-                    }
-                    $shared[] = $t;
-                }
-            }
-        }
-    }
 
-    // Workbook sheet names + paths
-    $wbXml = $zip->getFromName('xl/workbook.xml');
-    $relsXml = $zip->getFromName('xl/_rels/workbook.xml.rels');
-    $sheetFiles = [];
-    if ($wbXml && $relsXml) {
-        $rels = [];
-        $rx = @simplexml_load_string($relsXml);
-        if ($rx) {
-            foreach ($rx->Relationship as $rel) {
-                $id = (string)$rel['Id'];
-                $target = (string)$rel['Target'];
-                if (strpos($target, 'worksheets/') !== false) {
-                    $rels[$id] = 'xl/' . ltrim($target, '/');
-                }
-            }
-        }
-        $wx = @simplexml_load_string($wbXml);
-        if ($wx) {
-            $wx->registerXPathNamespace('m', 'http://schemas.openxmlformats.org/spreadsheetml/2006/main');
-            $wx->registerXPathNamespace('r', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships');
-            $i = 0;
-            foreach ($wx->sheets->sheet as $sheet) {
-                $name = (string)$sheet['name'];
-                $rid = (string)$sheet->attributes('r', true)['id'];
-                if (!$rid) {
-                    // fallback sheet1, sheet2...
-                    $i++;
-                    $pathSheet = "xl/worksheets/sheet{$i}.xml";
-                } else {
-                    $pathSheet = $rels[$rid] ?? null;
-                }
-                if ($pathSheet) $sheetFiles[$name] = $pathSheet;
-            }
-        }
-    }
-    if (empty($sheetFiles)) {
-        // fallback
-        for ($i = 1; $i <= 20; $i++) {
-            $p = "xl/worksheets/sheet{$i}.xml";
-            if ($zip->getFromName($p) !== false) $sheetFiles["Sheet$i"] = $p;
-        }
-    }
-
-    foreach ($sheetFiles as $sheetName => $sheetPath) {
-        $xml = $zip->getFromName($sheetPath);
-        if (!$xml) continue;
-        $sx = @simplexml_load_string($xml);
-        if (!$sx) continue;
-
-        $grid = [];
-        $maxCol = 0;
-        foreach ($sx->sheetData->row as $row) {
-            $rIdx = (int)$row['r'] - 1;
-            foreach ($row->c as $c) {
-                $ref = (string)$c['r'];
-                if (!preg_match('/^([A-Z]+)(\d+)$/', $ref, $m)) continue;
-                $col = 0;
-                foreach (str_split($m[1]) as $ch) $col = $col * 26 + (ord($ch) - 64);
-                $col--;
-                if ($col > $maxCol) $maxCol = $col;
-                $val = '';
-                $type = isset($c['t']) ? (string)$c['t'] : '';
-                if ($type === 's') {
-                    $si = (int)$c->v;
-                    $val = $shared[$si] ?? '';
-                } elseif ($type === 'inlineStr') {
-                    $val = (string)($c->is->t ?? '');
-                } else {
-                    $val = (string)($c->v ?? '');
-                }
-                $grid[$rIdx][$col] = $val;
-            }
-        }
-        $rows = [];
-        if (!empty($grid)) {
-            ksort($grid);
-            $maxR = max(array_keys($grid));
-            for ($r = 0; $r <= $maxR; $r++) {
-                $line = [];
-                for ($c = 0; $c <= $maxCol; $c++) {
-                    $line[] = isset($grid[$r][$c]) ? $grid[$r][$c] : '';
-                }
-                $rows[] = $line;
-            }
-        }
-        $result[$sheetName] = $rows;
-    }
-    $zip->close();
-    return $result;
+function resultsColFlags($conn) {
+    $f = ['json'=>false,'a3'=>false,'remarks'=>false];
+    try {
+        $f['json'] = ($conn->query("SHOW COLUMNS FROM results LIKE 'assignments_json'")->num_rows > 0);
+        $f['a3'] = ($conn->query("SHOW COLUMNS FROM results LIKE 'assignment3'")->num_rows > 0);
+        $f['remarks'] = ($conn->query("SHOW COLUMNS FROM results LIKE 'remarks'")->num_rows > 0);
+    } catch (Throwable $e) {}
+    return $f;
 }
 
-function normalizeHeader($h) {
-    return strtolower(trim(preg_replace('/\s+/', ' ', (string)$h)));
-}
-
-/**
- * Detect column map from a sheet's rows (HDICRA style)
- */
-function detectHdicraColumns($rows) {
-    $map = ['reg' => null, 'name' => null, 'phone' => null, 'a1' => null, 'a2' => null, 'a3' => null, 'exam' => null, 'header_row' => null];
-
-    for ($r = 0; $r < min(25, count($rows)); $r++) {
-        $row = $rows[$r];
-        $foundReg = false;
-        for ($c = 0; $c < count($row); $c++) {
-            $h = normalizeHeader($row[$c]);
-            if ($h === '' ) continue;
-            if ($h === 'reg no' || $h === 'registration number' || strpos($h, 'reg no') === 0) {
-                $map['reg'] = $c; $foundReg = true;
-            }
-            if ($h === 'student id number' && $map['reg'] === null) {
-                // Batch 08 style - may not be real ICRA reg
-                $map['reg'] = $c; $foundReg = true;
-            }
-            if ($h === 'name' || $h === 'full name') $map['name'] = $c;
-            if (strpos($h, 'whatsapp') !== false || $h === 'phone') $map['phone'] = $c;
-            if (strpos($h, '1st assignment') !== false || strpos($h, '01st assig') !== false) $map['a1'] = $c;
-            if (strpos($h, '2nd assignment') !== false || strpos($h, '02nd assig') !== false) $map['a2'] = $c;
-            if (strpos($h, '3rd assignment') !== false) $map['a3'] = $c;
-            if (strpos($h, 'final exam') !== false) $map['exam'] = $c;
-        }
-        if ($foundReg && ($map['name'] !== null || $map['a1'] !== null)) {
-            $map['header_row'] = $r;
-            break;
-        }
-    }
-    return $map;
-}
-
-function cellVal($row, $idx) {
-    if ($idx === null || $idx < 0 || $idx >= count($row)) return '';
-    $v = $row[$idx];
-    if ($v === null) return '';
-    return trim((string)$v);
-}
-
-function parseNum($v) {
-    $v = trim((string)$v);
-    if ($v === '' || !is_numeric($v)) return null;
-    return (float)$v;
-}
-
-function ensureCourseAndBatch($conn, $regNo) {
-    // ICRA/B01/001 → course ICRA, batch B01
-    if (!preg_match('/^([A-Za-z]+)\/([A-Za-z0-9]+)\/(\d+)/', $regNo, $m)) {
-        return null;
-    }
-    $courseCode = strtoupper($m[1]);
-    $batchCode = strtoupper($m[2]);
-
-    $course = $conn->query("SELECT id FROM courses WHERE course_code='".$conn->real_escape_string($courseCode)."' LIMIT 1")->fetch_assoc();
-    if (!$course) {
-        $conn->query("INSERT INTO courses (course_code, course_name, is_active) VALUES ('".$conn->real_escape_string($courseCode)."', '".$conn->real_escape_string($courseCode)." Course', 1)");
-        $courseId = $conn->insert_id;
+function createPaymentStub($conn, $sid) {
+    $hasReg = false; $hasInst = false;
+    try {
+        $hasReg = ($conn->query("SHOW COLUMNS FROM payments LIKE 'reg_fee'")->num_rows > 0);
+        $hasInst = ($conn->query("SHOW COLUMNS FROM payments LIKE 'installments_json'")->num_rows > 0);
+    } catch (Throwable $e) {}
+    if ($hasReg && $hasInst) {
+        $conn->query("INSERT INTO payments (student_id, payment_status, reg_fee, course_paid, course_due, balance, amount, installments_json) VALUES ($sid, 'PENDING', 0, 0, 0, 0, 0, '{}')");
+    } elseif ($hasReg) {
+        $conn->query("INSERT INTO payments (student_id, payment_status, reg_fee, course_paid, course_due, balance, amount) VALUES ($sid, 'PENDING', 0, 0, 0, 0, 0)");
     } else {
-        $courseId = (int)$course['id'];
+        $conn->query("INSERT INTO payments (student_id, payment_status) VALUES ($sid, 'PENDING')");
     }
-
-    $batch = $conn->query("SELECT id FROM batches WHERE course_id=$courseId AND batch_code='".$conn->real_escape_string($batchCode)."' LIMIT 1")->fetch_assoc();
-    if (!$batch) {
-        $conn->query("INSERT INTO batches (course_id, batch_code, batch_name, is_active) VALUES ($courseId, '".$conn->real_escape_string($batchCode)."', '".$conn->real_escape_string($courseCode.' '.$batchCode)."', 1)");
-        $batchId = $conn->insert_id;
-    } else {
-        $batchId = (int)$batch['id'];
-    }
-    return $batchId;
 }
 
-// ===================== UPLOAD HDICRA / EXCEL =====================
+// ===================== EXCEL UPLOAD =====================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'upload') {
+    @set_time_limit(300);
+    @ini_set('memory_limit', '512M');
     $admin = getAdminUsername();
     $createMissing = !empty($_POST['create_students']);
-    $stats = ['sheets' => 0, 'students_new' => 0, 'students_found' => 0, 'results_new' => 0, 'results_updated' => 0, 'skipped' => 0, 'errors' => []];
+    $stats = ['sheets'=>0,'students_new'=>0,'students_found'=>0,'results_new'=>0,'results_updated'=>0,'skipped'=>0,'errors'=>[]];
+    $cols = resultsColFlags($conn);
+    ensurePaymentsSchema($conn);   // NEW: make sure payments table has all columns + status enum values
 
     if (!isset($_FILES['excel_file']) || $_FILES['excel_file']['error'] !== UPLOAD_ERR_OK) {
         setFlash('error', 'Please select a valid Excel file.');
         redirect('results.php');
     }
-
     $file = $_FILES['excel_file'];
     $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
     $tmp = $file['tmp_name'];
-
-    if (!in_array($ext, ['xlsx', 'xls', 'csv'])) {
+    if (!in_array($ext, ['xlsx','xls','csv'])) {
         setFlash('error', 'Only .xlsx or .csv allowed.');
         redirect('results.php');
     }
 
     $allSheets = [];
     if ($ext === 'csv') {
-        $rows = [];
-        $h = fopen($tmp, 'r');
-        $bom = fread($h, 3);
-        if ($bom !== "\xEF\xBB\xBF") rewind($h);
+        $rows = []; $h = fopen($tmp, 'r');
+        $bom = fread($h, 3); if ($bom !== "\xEF\xBB\xBF") rewind($h);
         while (($d = fgetcsv($h)) !== false) $rows[] = $d;
-        fclose($h);
-        $allSheets['CSV'] = $rows;
+        fclose($h); $allSheets['CSV'] = $rows;
     } else {
         $allSheets = readXlsxAllSheets($tmp);
         if (empty($allSheets)) {
-            setFlash('error', 'Could not read Excel file. Try Save As → CSV UTF-8.');
+            setFlash('error', 'Could not read Excel file.');
             redirect('results.php');
         }
     }
@@ -243,47 +73,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
         if (empty($rows)) continue;
         $map = detectHdicraColumns($rows);
         if ($map['header_row'] === null) {
-            // try Batch 08 style: first cell looks like ICRA/Bxx/
             $found = false;
             for ($r = 0; $r < min(20, count($rows)); $r++) {
                 $c0 = cellVal($rows[$r], 0);
                 if (preg_match('/^[A-Za-z]+\/[A-Za-z0-9]+\/\d+/', $c0)) {
-                    $map = ['reg' => 0, 'name' => 2, 'phone' => 4, 'a1' => 70, 'a2' => 71, 'exam' => 72, 'header_row' => $r - 1];
-                    if ($map['header_row'] < 0) $map['header_row'] = $r;
-                    $found = true;
-                    break;
+                    $map = ['reg'=>0,'name'=>2,'phone'=>4,'a1'=>null,'a2'=>null,'a3'=>null,'exam'=>null,'header_row'=>max(0,$r-1)];
+                    $found = true; break;
                 }
             }
             if (!$found) continue;
         }
-
         $stats['sheets']++;
-        $start = $map['header_row'] + 1;
-
-        for ($r = $start; $r < count($rows); $r++) {
+        for ($r = $map['header_row'] + 1; $r < count($rows); $r++) {
             $row = $rows[$r];
             $regNo = cellVal($row, $map['reg']);
-
-            // Batch 08: header may point to SC-2026-xxx; real reg is often col 0
             if (!preg_match('/^[A-Za-z]+\/[A-Za-z0-9]+\/\d+/', $regNo)) {
-                $c0 = cellVal($row, 0);
-                if (preg_match('/^[A-Za-z]+\/[A-Za-z0-9]+\/\d+/', $c0)) {
-                    $regNo = $c0;
-                } else {
-                    $c1 = cellVal($row, 1);
-                    if (preg_match('/^[A-Za-z]+\/[A-Za-z0-9]+\/\d+/', $c1)) {
-                        $regNo = $c1;
-                    }
-                }
+                $c0 = cellVal($row, 0); $c1 = cellVal($row, 1);
+                if (preg_match('/^[A-Za-z]+\/[A-Za-z0-9]+\/\d+/', $c0)) $regNo = $c0;
+                elseif (preg_match('/^[A-Za-z]+\/[A-Za-z0-9]+\/\d+/', $c1)) $regNo = $c1;
             }
+            if (!preg_match('/^[A-Za-z]+\/[A-Za-z0-9]+\/\d+/', $regNo)) continue;
 
-            if (!preg_match('/^[A-Za-z]+\/[A-Za-z0-9]+\/\d+/', $regNo)) {
-                continue; // not a student row
-            }
-
-            $name  = cellVal($row, $map['name']);
+            $name = cellVal($row, $map['name']);
             $phone = cellVal($row, $map['phone']);
-            // clean phone (Excel may give float)
             if (is_numeric($phone) && strpos($phone, '.') !== false) $phone = (string)(int)(float)$phone;
 
             $a1 = parseNum(cellVal($row, $map['a1']));
@@ -291,65 +103,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
             $a3 = parseNum(cellVal($row, $map['a3']));
             $exam = parseNum(cellVal($row, $map['exam']));
 
-            // Find or create student
             $st = $conn->prepare("SELECT id FROM students WHERE registration_number = ? LIMIT 1");
-            $st->bind_param("s", $regNo);
-            $st->execute();
-            $student = $st->get_result()->fetch_assoc();
-            $st->close();
+            $st->bind_param("s", $regNo); $st->execute();
+            $student = $st->get_result()->fetch_assoc(); $st->close();
 
             if (!$student) {
                 if (!$createMissing) {
-                    $stats['errors'][] = "$sheetName: Student not found $regNo (enable Auto-create)";
-                    $stats['skipped']++;
-                    continue;
+                    $stats['errors'][] = "$sheetName: Student not found $regNo";
+                    $stats['skipped']++; continue;
                 }
                 $batchId = ensureCourseAndBatch($conn, $regNo);
-                if (!$batchId) {
-                    $stats['errors'][] = "$sheetName: Bad reg format $regNo";
-                    $stats['skipped']++;
-                    continue;
-                }
+                if (!$batchId) { $stats['skipped']++; continue; }
                 if ($name === '') $name = $regNo;
                 $ins = $conn->prepare("INSERT INTO students (registration_number, full_name, phone, batch_id, is_active) VALUES (?,?,?,?,1)");
                 $ins->bind_param("sssi", $regNo, $name, $phone, $batchId);
-                if ($ins->execute()) {
-                    $sid = $ins->insert_id;
-                    $conn->query("INSERT INTO results (student_id, result_status) VALUES ($sid, 'PENDING')");
-                    $conn->query("INSERT INTO payments (student_id, payment_status) VALUES ($sid, 'PENDING')");
-                    $conn->query("INSERT INTO certificates (student_id, certificate_status) VALUES ($sid, 'PENDING')");
-                    $stats['students_new']++;
-                } else {
-                    $stats['errors'][] = "$sheetName: Cannot create $regNo — ".$ins->error;
-                    $stats['skipped']++;
-                    $ins->close();
-                    continue;
-                }
-                $ins->close();
+                if (!$ins->execute()) { $stats['errors'][] = "$regNo create fail"; $stats['skipped']++; $ins->close(); continue; }
+                $sid = $ins->insert_id; $ins->close();
+                $conn->query("INSERT INTO results (student_id, result_status) VALUES ($sid, 'PENDING')");
+                createPaymentStub($conn, $sid);
+                $conn->query("INSERT INTO certificates (student_id, certificate_status) VALUES ($sid, 'PENDING')");
+                $stats['students_new']++;
             } else {
                 $sid = (int)$student['id'];
                 $stats['students_found']++;
-                // optional update name/phone if empty in DB
-                if ($name !== '' || $phone !== '') {
-                    $conn->query("UPDATE students SET full_name=IF(full_name='' OR full_name IS NULL, '".$conn->real_escape_string($name)."', full_name), phone=IF(phone='' OR phone IS NULL, '".$conn->real_escape_string($phone)."', phone) WHERE id=$sid");
-                }
             }
 
-            // Build marks
             $assignments = [];
             if ($a1 !== null) $assignments[] = $a1;
             if ($a2 !== null) $assignments[] = $a2;
             if ($a3 !== null) $assignments[] = $a3;
             $exams = [];
             if ($exam !== null) $exams[] = $exam;
-
             $full = array_sum($assignments) + array_sum($exams);
             if ($full == 0) $full = null;
             $allM = array_merge($assignments, $exams);
             $pct = count($allM) > 0 ? array_sum($allM) / count($allM) : null;
+            $status = ($full !== null && $full > 0) ? 'PRESENT' : 'PENDING';
 
-            $status = 'PENDING';
-            if ($full !== null && $full > 0) $status = 'PRESENT';
+            if ($full === null && empty($assignments) && empty($exams)) continue; // no marks in excel
 
             $a1s = isset($assignments[0]) ? (string)$assignments[0] : null;
             $a2s = isset($assignments[1]) ? (string)$assignments[1] : null;
@@ -360,119 +151,164 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'uploa
             $aj = json_encode($assignments);
             $ej = json_encode($exams);
 
-            $hasJson = ($conn->query("SHOW COLUMNS FROM results LIKE 'assignments_json'")->num_rows > 0);
             $exists = $conn->query("SELECT id FROM results WHERE student_id=$sid")->fetch_assoc();
-
-            if ($exists) {
-                // Only overwrite marks if Excel has at least one mark, else keep existing and just touch status if needed
-                if ($full === null && empty($assignments) && empty($exams)) {
-                    // no marks in excel — skip result update
-                    continue;
-                }
-                if ($hasJson) {
-                    $stmt = $conn->prepare("UPDATE results SET assignment1=?, assignment2=?, assignment3=?, final_exam=?, full_marks=?, marks_percentage=?, result_status=?, entered_by=?, assignments_json=?, exams_json=? WHERE student_id=?");
-                    $stmt->bind_param("ssssssssssi", $a1s,$a2s,$a3s,$fes,$fulls,$pcts,$status,$admin,$aj,$ej,$sid);
+            try {
+                if ($exists) {
+                    // status first
+                    $s1 = $conn->prepare("UPDATE results SET result_status=?, entered_by=? WHERE student_id=?");
+                    $s1->bind_param("ssi", $status, $admin, $sid); $s1->execute(); $s1->close();
+                    if ($cols['a3'] && $cols['json']) {
+                        $stmt = $conn->prepare("UPDATE results SET assignment1=?,assignment2=?,assignment3=?,final_exam=?,full_marks=?,marks_percentage=?,assignments_json=?,exams_json=? WHERE student_id=?");
+                        $stmt->bind_param("ssssssssi", $a1s,$a2s,$a3s,$fes,$fulls,$pcts,$aj,$ej,$sid);
+                    } elseif ($cols['a3']) {
+                        $stmt = $conn->prepare("UPDATE results SET assignment1=?,assignment2=?,assignment3=?,final_exam=?,full_marks=?,marks_percentage=? WHERE student_id=?");
+                        $stmt->bind_param("ssssssi", $a1s,$a2s,$a3s,$fes,$fulls,$pcts,$sid);
+                    } else {
+                        $stmt = $conn->prepare("UPDATE results SET assignment1=?,assignment2=?,final_exam=?,full_marks=?,marks_percentage=? WHERE student_id=?");
+                        $stmt->bind_param("sssssi", $a1s,$a2s,$fes,$fulls,$pcts,$sid);
+                    }
+                    if ($stmt->execute()) $stats['results_updated']++;
+                    else $stats['errors'][] = "$regNo: ".$stmt->error;
+                    $stmt->close();
                 } else {
-                    $stmt = $conn->prepare("UPDATE results SET assignment1=?, assignment2=?, assignment3=?, final_exam=?, full_marks=?, marks_percentage=?, result_status=?, entered_by=? WHERE student_id=?");
-                    $stmt->bind_param("ssssssssi", $a1s,$a2s,$a3s,$fes,$fulls,$pcts,$status,$admin,$sid);
+                    if ($cols['a3'] && $cols['json']) {
+                        $stmt = $conn->prepare("INSERT INTO results (student_id,assignment1,assignment2,assignment3,final_exam,full_marks,marks_percentage,result_status,entered_by,assignments_json,exams_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)");
+                        $stmt->bind_param("issssssssss", $sid,$a1s,$a2s,$a3s,$fes,$fulls,$pcts,$status,$admin,$aj,$ej);
+                    } else {
+                        $stmt = $conn->prepare("INSERT INTO results (student_id,assignment1,assignment2,final_exam,full_marks,marks_percentage,result_status,entered_by) VALUES (?,?,?,?,?,?,?,?)");
+                        $stmt->bind_param("isssssss", $sid,$a1s,$a2s,$fes,$fulls,$pcts,$status,$admin);
+                    }
+                    if ($stmt->execute()) $stats['results_new']++;
+                    else $stats['errors'][] = "$regNo: ".$stmt->error;
+                    $stmt->close();
                 }
-                if ($stmt->execute()) $stats['results_updated']++;
-                else $stats['errors'][] = "$regNo update fail: ".$stmt->error;
-                $stmt->close();
-            } else {
-                if ($hasJson) {
-                    $stmt = $conn->prepare("INSERT INTO results (student_id, assignment1, assignment2, assignment3, final_exam, full_marks, marks_percentage, result_status, entered_by, assignments_json, exams_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)");
-                    $stmt->bind_param("issssssssss", $sid,$a1s,$a2s,$a3s,$fes,$fulls,$pcts,$status,$admin,$aj,$ej);
-                } else {
-                    $stmt = $conn->prepare("INSERT INTO results (student_id, assignment1, assignment2, assignment3, final_exam, full_marks, marks_percentage, result_status, entered_by) VALUES (?,?,?,?,?,?,?,?,?)");
-                    $stmt->bind_param("issssssss", $sid,$a1s,$a2s,$a3s,$fes,$fulls,$pcts,$status,$admin);
-                }
-                if ($stmt->execute()) $stats['results_new']++;
-                else $stats['errors'][] = "$regNo insert fail: ".$stmt->error;
-                $stmt->close();
+            } catch (Throwable $e) {
+                $stats['errors'][] = "$regNo: ".$e->getMessage();
             }
         }
     }
 
-    logActivity($admin, 'HDICRA_UPLOAD', json_encode($stats));
-    $msg = "Sheets: {$stats['sheets']} | Students new: {$stats['students_new']} | Found: {$stats['students_found']} | Results new: {$stats['results_new']} | Updated: {$stats['results_updated']} | Skipped: {$stats['skipped']}";
-    if ($stats['errors']) {
-        $_SESSION['upload_errors'] = array_slice($stats['errors'], 0, 20);
-        $msg .= " | Errors: ".count($stats['errors']);
+    // ===================== NEW: PAYMENTS from the same Excel =====================
+    // (runs AFTER the students were created above, so every student already exists)
+    $payStats = null; $payNotes = [];
+    if ($ext === 'xlsx') {
+        $payStats = payImportFromXlsx($conn, $tmp, $admin, $payNotes);
+    } elseif ($ext === 'xls') {
+        $payNotes[] = 'Payments: .xls is not supported for payments, please save the file as .xlsx';
     }
+    // ==============================================================================
+
+    logActivity($admin, 'HDICRA_UPLOAD', json_encode(['results' => $stats, 'payments' => $payStats]));
+    $msg = "Sheets: {$stats['sheets']} | Students new: {$stats['students_new']} | Found: {$stats['students_found']} | Results new: {$stats['results_new']} | Updated: {$stats['results_updated']}";
+    if ($payStats) {
+        $msg .= " || PAYMENTS saved: {$payStats['students']} (Completed {$payStats['completed']}, One time {$payStats['one_time']}, Partial {$payStats['partial']}, Not paid {$payStats['none']}, No data {$payStats['nodata']}, Not found {$payStats['notfound']}, Failed {$payStats['failed']})";
+    }
+    $allNotes = array_merge($stats['errors'], $payNotes);
+    if ($stats['errors']) $msg .= " | Errors: ".count($stats['errors']);
+    if ($allNotes) $_SESSION['upload_errors'] = array_slice($allNotes, 0, 60);
     setFlash('success', $msg);
     redirect('results.php');
 }
 
-// ===================== SINGLE UPDATE (same as before) =====================
+// ===================== SINGLE UPDATE =====================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'update') {
-    $student_id = (int)$_POST['student_id'];
+    $student_id = (int)($_POST['student_id'] ?? 0);
+    $admin = getAdminUsername();
+    if (!$student_id) { setFlash('error', 'Invalid student'); redirect('results.php'); }
+
     $assignments = [];
     if (!empty($_POST['assignments']) && is_array($_POST['assignments'])) {
-        foreach ($_POST['assignments'] as $val) {
-            if ($val !== '' && is_numeric($val)) $assignments[] = (float)$val;
-        }
+        foreach ($_POST['assignments'] as $val) if ($val !== '' && is_numeric($val)) $assignments[] = (float)$val;
     }
     $exams = [];
     if (!empty($_POST['exams']) && is_array($_POST['exams'])) {
-        foreach ($_POST['exams'] as $val) {
-            if ($val !== '' && is_numeric($val)) $exams[] = (float)$val;
-        }
+        foreach ($_POST['exams'] as $val) if ($val !== '' && is_numeric($val)) $exams[] = (float)$val;
     }
     $full = array_sum($assignments) + array_sum($exams);
     if ($full == 0) $full = null;
     $allMarks = array_merge($assignments, $exams);
     $pct = null;
-    if (isset($_POST['marks_percentage']) && $_POST['marks_percentage'] !== '') {
-        $pct = (float)$_POST['marks_percentage'];
-    } elseif (count($allMarks) > 0) {
-        $pct = array_sum($allMarks) / count($allMarks);
-    }
-    $status = $_POST['result_status'] ?? 'PENDING';
+    if (isset($_POST['marks_percentage']) && $_POST['marks_percentage'] !== '') $pct = (float)$_POST['marks_percentage'];
+    elseif (count($allMarks) > 0) $pct = array_sum($allMarks) / count($allMarks);
+
+    $status = trim($_POST['result_status'] ?? 'PENDING');
+    if (!in_array($status, ['PENDING','PRESENT','ABSENT','NOT_ELIGIBLE'], true)) $status = 'PENDING';
     $remarks = trim($_POST['remarks'] ?? '');
-    $admin = getAdminUsername();
-    $aj = json_encode($assignments);
-    $ej = json_encode($exams);
+
     $a1 = isset($assignments[0]) ? (string)$assignments[0] : null;
     $a2 = isset($assignments[1]) ? (string)$assignments[1] : null;
     $a3 = isset($assignments[2]) ? (string)$assignments[2] : null;
     $fe = isset($exams[0]) ? (string)$exams[0] : null;
     $full_s = $full !== null ? (string)$full : null;
-    $pct_s = $pct !== null ? (string)$pct : null;
-    $hasJson = ($conn->query("SHOW COLUMNS FROM results LIKE 'assignments_json'")->num_rows > 0);
-    $check = $conn->query("SELECT id FROM results WHERE student_id=$student_id");
-    if ($check && $check->num_rows > 0) {
-        if ($hasJson) {
-            $stmt = $conn->prepare("UPDATE results SET assignment1=?,assignment2=?,assignment3=?,final_exam=?,full_marks=?,marks_percentage=?,result_status=?,remarks=?,entered_by=?,assignments_json=?,exams_json=? WHERE student_id=?");
-            $stmt->bind_param("sssssssssssi",$a1,$a2,$a3,$fe,$full_s,$pct_s,$status,$remarks,$admin,$aj,$ej,$student_id);
+    $pct_s = $pct !== null ? (string)round($pct, 2) : null;
+    $aj = json_encode($assignments);
+    $ej = json_encode($exams);
+    $cols = resultsColFlags($conn);
+
+    $ok = false; $errMsg = '';
+    try {
+        $exists = $conn->query("SELECT id FROM results WHERE student_id=$student_id LIMIT 1");
+        if ($exists && $exists->num_rows > 0) {
+            // ALWAYS save status first
+            $s1 = $conn->prepare("UPDATE results SET result_status=?, entered_by=? WHERE student_id=?");
+            $s1->bind_param("ssi", $status, $admin, $student_id);
+            $ok = $s1->execute();
+            if (!$ok) $errMsg = $s1->error;
+            $s1->close();
+
+            if ($ok) {
+                if ($cols['a3'] && $cols['json'] && $cols['remarks']) {
+                    $stmt = $conn->prepare("UPDATE results SET assignment1=?,assignment2=?,assignment3=?,final_exam=?,full_marks=?,marks_percentage=?,remarks=?,assignments_json=?,exams_json=? WHERE student_id=?");
+                    $stmt->bind_param("sssssssssi", $a1,$a2,$a3,$fe,$full_s,$pct_s,$remarks,$aj,$ej,$student_id);
+                } elseif ($cols['remarks']) {
+                    $stmt = $conn->prepare("UPDATE results SET assignment1=?,assignment2=?,final_exam=?,full_marks=?,marks_percentage=?,remarks=? WHERE student_id=?");
+                    $stmt->bind_param("ssssssi", $a1,$a2,$fe,$full_s,$pct_s,$remarks,$student_id);
+                } else {
+                    $stmt = $conn->prepare("UPDATE results SET assignment1=?,assignment2=?,final_exam=?,full_marks=?,marks_percentage=? WHERE student_id=?");
+                    $stmt->bind_param("sssssi", $a1,$a2,$fe,$full_s,$pct_s,$student_id);
+                }
+                if (!$stmt->execute()) $errMsg = 'Status saved; marks: '.$stmt->error;
+                $stmt->close();
+            }
         } else {
-            $stmt = $conn->prepare("UPDATE results SET assignment1=?,assignment2=?,assignment3=?,final_exam=?,full_marks=?,marks_percentage=?,result_status=?,remarks=?,entered_by=? WHERE student_id=?");
-            $stmt->bind_param("sssssssssi",$a1,$a2,$a3,$fe,$full_s,$pct_s,$status,$remarks,$admin,$student_id);
+            if ($cols['a3'] && $cols['json'] && $cols['remarks']) {
+                $stmt = $conn->prepare("INSERT INTO results (student_id,assignment1,assignment2,assignment3,final_exam,full_marks,marks_percentage,result_status,remarks,entered_by,assignments_json,exams_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+                $stmt->bind_param("isssssssssss", $student_id,$a1,$a2,$a3,$fe,$full_s,$pct_s,$status,$remarks,$admin,$aj,$ej);
+            } elseif ($cols['remarks']) {
+                $stmt = $conn->prepare("INSERT INTO results (student_id,assignment1,assignment2,final_exam,full_marks,marks_percentage,result_status,remarks,entered_by) VALUES (?,?,?,?,?,?,?,?,?)");
+                $stmt->bind_param("issssssss", $student_id,$a1,$a2,$fe,$full_s,$pct_s,$status,$remarks,$admin);
+            } else {
+                $stmt = $conn->prepare("INSERT INTO results (student_id,assignment1,assignment2,final_exam,full_marks,marks_percentage,result_status,entered_by) VALUES (?,?,?,?,?,?,?,?)");
+                $stmt->bind_param("isssssss", $student_id,$a1,$a2,$fe,$full_s,$pct_s,$status,$admin);
+            }
+            $ok = $stmt->execute();
+            if (!$ok) $errMsg = $stmt->error;
+            $stmt->close();
         }
-    } else {
-        if ($hasJson) {
-            $stmt = $conn->prepare("INSERT INTO results (student_id,assignment1,assignment2,assignment3,final_exam,full_marks,marks_percentage,result_status,remarks,entered_by,assignments_json,exams_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
-            $stmt->bind_param("isssssssssss",$student_id,$a1,$a2,$a3,$fe,$full_s,$pct_s,$status,$remarks,$admin,$aj,$ej);
-        } else {
-            $stmt = $conn->prepare("INSERT INTO results (student_id,assignment1,assignment2,assignment3,final_exam,full_marks,marks_percentage,result_status,remarks,entered_by) VALUES (?,?,?,?,?,?,?,?,?,?)");
-            $stmt->bind_param("isssssssss",$student_id,$a1,$a2,$a3,$fe,$full_s,$pct_s,$status,$remarks,$admin);
-        }
-    }
-    if ($stmt->execute()) {
+    } catch (Throwable $e) { $ok = false; $errMsg = $e->getMessage(); }
+
+    if ($ok) {
         $pay = $conn->query("SELECT payment_status FROM payments WHERE student_id=$student_id")->fetch_assoc();
         $payOk = $pay && in_array($pay['payment_status'], ['PAID','COMPLETED','ONE_TIME','CONVA_PAY']);
-        $passOk = ($status==='PRESENT') && (($full!==null && $full>=40) || ($pct!==null && $pct>=40));
-        if ($status==='ABSENT' || $status==='NOT_ELIGIBLE') {
+        $passOk = ($status === 'PRESENT') && (($full !== null && $full >= 40) || ($pct !== null && $pct >= 40));
+        if ($status === 'ABSENT' || $status === 'NOT_ELIGIBLE') {
             $conn->query("UPDATE certificates SET certificate_status='NOT_ELIGIBLE' WHERE student_id=$student_id");
         } elseif ($passOk && $payOk) {
-            $conn->query("UPDATE certificates SET certificate_status='READY' WHERE student_id=$student_id");
+            $conn->query("UPDATE certificates SET certificate_status='READY' WHERE student_id=$student_id AND certificate_status!='ISSUED'");
         } else {
-            $conn->query("UPDATE certificates SET certificate_status='PENDING' WHERE student_id=$student_id");
+            $conn->query("UPDATE certificates SET certificate_status='PENDING' WHERE student_id=$student_id AND certificate_status!='ISSUED'");
         }
-        setFlash('success', 'Result saved.');
-    } else setFlash('error', $stmt->error);
-    $stmt->close();
-    redirect('results.php?'.http_build_query(array_filter(['course_id'=>$_POST['redirect_course']??'','batch_id'=>$_POST['redirect_batch']??'','q'=>$_POST['redirect_q']??''])));
+        logActivity($admin, 'UPDATE_RESULT', "Student:$student_id Status:$status");
+        setFlash('success', 'Result saved. Status: ' . $status);
+    } else {
+        setFlash('error', 'Could not save: ' . ($errMsg ?: 'unknown'));
+    }
+    $qs = http_build_query(array_filter([
+        'course_id' => $_POST['redirect_course'] ?? '',
+        'batch_id' => $_POST['redirect_batch'] ?? '',
+        'q' => $_POST['redirect_q'] ?? '',
+    ]));
+    redirect('results.php' . ($qs ? '?' . $qs : ''));
 }
 
 // ===================== LIST =====================
@@ -488,10 +324,11 @@ $batchesArr = [];
 $q = $conn->query("SELECT b.id, b.batch_code, b.batch_name, c.course_code FROM batches b JOIN courses c ON b.course_id=c.id ORDER BY c.course_code, b.batch_code");
 while ($b = $q->fetch_assoc()) $batchesArr[] = $b;
 
-$hasJson = ($conn->query("SHOW COLUMNS FROM results LIKE 'assignments_json'")->num_rows > 0);
+$cols = resultsColFlags($conn);
 $sql = "SELECT s.id AS student_id, s.registration_number, s.full_name, b.batch_code, c.course_code, c.course_name,
-        r.assignment1, r.assignment2, r.assignment3, r.final_exam, r.full_marks, r.marks_percentage, r.result_status, r.remarks";
-if ($hasJson) $sql .= ", r.assignments_json, r.exams_json";
+        r.assignment1, r.assignment2, r.final_exam, r.full_marks, r.marks_percentage, r.result_status, r.remarks";
+if ($cols['a3']) $sql .= ", r.assignment3";
+if ($cols['json']) $sql .= ", r.assignments_json, r.exams_json";
 $sql .= " FROM students s JOIN batches b ON s.batch_id=b.id JOIN courses c ON b.course_id=c.id
         LEFT JOIN results r ON s.id=r.student_id WHERE s.is_active=1";
 if ($filterCourse) $sql .= " AND c.id=$filterCourse";
@@ -519,15 +356,12 @@ require_once __DIR__ . '/../includes/header.php';
             <div class="col-md-5">
                 <label class="form-label">HDICRA.xlsx file</label>
                 <input type="file" name="excel_file" class="form-control" accept=".xlsx,.xls,.csv" required>
-                <small class="text-muted">Reads <strong>all sheets</strong> (Batch 01 … Batch 08). Columns: Reg No, Name, 1st/2nd Assignment, Final Exam.</small>
+                <small class="text-muted">All sheets. Saves <strong>Results</strong> (Reg No, Name, Assignments, Final Exam) and <strong>Payments</strong> (Registration Fee, 1st&ndash;6th Installments) together.</small>
             </div>
             <div class="col-md-4">
                 <div class="form-check mt-4">
                     <input class="form-check-input" type="checkbox" name="create_students" value="1" id="createStudents" checked>
-                    <label class="form-check-label" for="createStudents">
-                        <strong>Auto-create students</strong> if Reg No not in system<br>
-                        <small class="text-muted">(also creates ICRA course + batches)</small>
-                    </label>
+                    <label class="form-check-label" for="createStudents"><strong>Auto-create students</strong> if missing</label>
                 </div>
             </div>
             <div class="col-md-3">
@@ -536,7 +370,7 @@ require_once __DIR__ . '/../includes/header.php';
         </form>
         <?php if (!empty($_SESSION['upload_errors'])): ?>
         <div class="alert alert-warning mt-3 mb-0">
-            <strong>Notes / skipped rows:</strong>
+            <strong>Notes:</strong>
             <ul class="mb-0 small"><?php foreach ($_SESSION['upload_errors'] as $e): ?><li><?php echo htmlspecialchars($e); ?></li><?php endforeach; ?></ul>
         </div>
         <?php unset($_SESSION['upload_errors']); endif; ?>
@@ -594,19 +428,22 @@ require_once __DIR__ . '/../includes/header.php';
             <?php if ($allRows): foreach ($allRows as $row):
                 $asgList=[]; $examList=[];
                 if (!empty($row['assignments_json'])) { $d=json_decode($row['assignments_json'],true); if(is_array($d))$asgList=$d; }
-                else { foreach(['assignment1','assignment2','assignment3'] as $k) if(isset($row[$k])&&$row[$k]!==null&&$row[$k]!=='') $asgList[]=$row[$k]; }
+                else { foreach (['assignment1','assignment2','assignment3'] as $k) if (isset($row[$k]) && $row[$k] !== null && $row[$k] !== '') $asgList[] = $row[$k]; }
                 if (!empty($row['exams_json'])) { $d=json_decode($row['exams_json'],true); if(is_array($d))$examList=$d; }
-                elseif(isset($row['final_exam'])&&$row['final_exam']!==null&&$row['final_exam']!=='') $examList[]=$row['final_exam'];
+                elseif (isset($row['final_exam']) && $row['final_exam'] !== null && $row['final_exam'] !== '') $examList[] = $row['final_exam'];
             ?>
                 <tr>
                     <td><code><?php echo sanitize($row['registration_number']); ?></code></td>
                     <td><?php echo sanitize($row['full_name']); ?></td>
                     <td><small><?php echo sanitize($row['course_code']); ?></small> <span class="badge bg-secondary"><?php echo sanitize($row['batch_code']); ?></span></td>
-                    <td><?php if($asgList): foreach($asgList as $i=>$m): ?><span class="badge bg-info text-dark me-1">A<?php echo $i+1; ?>: <?php echo $m; ?></span><?php endforeach; else: echo '—'; endif; ?></td>
-                    <td><?php if($examList): foreach($examList as $i=>$m): ?><span class="badge bg-warning text-dark me-1">E<?php echo $i+1; ?>: <?php echo $m; ?></span><?php endforeach; else: echo '—'; endif; ?></td>
-                    <td><strong><?php echo $row['full_marks']!==null?$row['full_marks']:'—'; ?></strong></td>
-                    <td><?php $all=array_merge($asgList,$examList); echo count($all)?number_format(array_sum($all)/count($all),2).'%':($row['marks_percentage']!==null?number_format((float)$row['marks_percentage'],2).'%':'—'); ?></td>
-                    <td><?php echo $row['result_status']?statusBadge($row['result_status']):statusBadge('PENDING'); ?></td>
+                    <td><?php if ($asgList): foreach ($asgList as $i=>$m): ?><span class="badge bg-info text-dark me-1">A<?php echo $i+1; ?>: <?php echo $m; ?></span><?php endforeach; else: echo '—'; endif; ?></td>
+                    <td><?php if ($examList): foreach ($examList as $i=>$m): ?><span class="badge bg-warning text-dark me-1">E<?php echo $i+1; ?>: <?php echo $m; ?></span><?php endforeach; else: echo '—'; endif; ?></td>
+                    <td><strong><?php echo $row['full_marks'] !== null ? $row['full_marks'] : '—'; ?></strong></td>
+                    <td><?php
+                        $all = array_merge($asgList, $examList);
+                        echo count($all) ? number_format(array_sum($all)/count($all), 2).'%' : ($row['marks_percentage'] !== null ? number_format((float)$row['marks_percentage'], 2).'%' : '—');
+                    ?></td>
+                    <td><?php echo $row['result_status'] ? statusBadge($row['result_status']) : statusBadge('PENDING'); ?></td>
                     <td><button type="button" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editResult<?php echo (int)$row['student_id']; ?>"><i class="bi bi-pencil"></i></button></td>
                 </tr>
             <?php endforeach; else: ?>
@@ -620,9 +457,9 @@ require_once __DIR__ . '/../includes/header.php';
 <?php foreach ($allRows as $row):
     $asgList=[]; $examList=[];
     if (!empty($row['assignments_json'])) { $d=json_decode($row['assignments_json'],true); if(is_array($d))$asgList=$d; }
-    else { foreach(['assignment1','assignment2','assignment3'] as $k) if(isset($row[$k])&&$row[$k]!==null&&$row[$k]!=='') $asgList[]=$row[$k]; }
+    else { foreach (['assignment1','assignment2','assignment3'] as $k) if (isset($row[$k]) && $row[$k] !== null && $row[$k] !== '') $asgList[] = $row[$k]; }
     if (!empty($row['exams_json'])) { $d=json_decode($row['exams_json'],true); if(is_array($d))$examList=$d; }
-    elseif(isset($row['final_exam'])&&$row['final_exam']!==null&&$row['final_exam']!=='') $examList[]=$row['final_exam'];
+    elseif (isset($row['final_exam']) && $row['final_exam'] !== null && $row['final_exam'] !== '') $examList[] = $row['final_exam'];
 ?>
 <div class="modal fade" id="editResult<?php echo (int)$row['student_id']; ?>" tabindex="-1">
     <div class="modal-dialog modal-lg"><div class="modal-content">
@@ -638,30 +475,30 @@ require_once __DIR__ . '/../includes/header.php';
                 <div class="mb-3">
                     <div class="d-flex justify-content-between mb-2"><label class="fw-bold mb-0">Assignments</label><button type="button" class="btn btn-sm btn-outline-success add-assignment"><i class="bi bi-plus"></i></button></div>
                     <div class="assignments-container row g-2">
-                        <?php $n=max(count($asgList),1); for($i=0;$i<$n;$i++): ?>
-                        <div class="col-md-4 assignment-item"><div class="input-group"><span class="input-group-text">A<?php echo $i+1; ?></span><input type="number" step="0.01" name="assignments[]" class="form-control mark-input" value="<?php echo $asgList[$i]??''; ?>"><button type="button" class="btn btn-outline-danger remove-item" <?php echo $n<=1?'disabled':''; ?>><i class="bi bi-trash"></i></button></div></div>
+                        <?php $n = max(count($asgList), 1); for ($i = 0; $i < $n; $i++): ?>
+                        <div class="col-md-4 assignment-item"><div class="input-group"><span class="input-group-text">A<?php echo $i+1; ?></span><input type="number" step="0.01" name="assignments[]" class="form-control mark-input" value="<?php echo $asgList[$i] ?? ''; ?>"><button type="button" class="btn btn-outline-danger remove-item" <?php echo $n <= 1 ? 'disabled' : ''; ?>><i class="bi bi-trash"></i></button></div></div>
                         <?php endfor; ?>
                     </div>
                 </div>
                 <div class="mb-3">
                     <div class="d-flex justify-content-between mb-2"><label class="fw-bold mb-0">Exams</label><button type="button" class="btn btn-sm btn-outline-success add-exam"><i class="bi bi-plus"></i></button></div>
                     <div class="exams-container row g-2">
-                        <?php $n=max(count($examList),1); for($i=0;$i<$n;$i++): ?>
-                        <div class="col-md-4 exam-item"><div class="input-group"><span class="input-group-text">E<?php echo $i+1; ?></span><input type="number" step="0.01" name="exams[]" class="form-control mark-input" value="<?php echo $examList[$i]??''; ?>"><button type="button" class="btn btn-outline-danger remove-item" <?php echo $n<=1?'disabled':''; ?>><i class="bi bi-trash"></i></button></div></div>
+                        <?php $n = max(count($examList), 1); for ($i = 0; $i < $n; $i++): ?>
+                        <div class="col-md-4 exam-item"><div class="input-group"><span class="input-group-text">E<?php echo $i+1; ?></span><input type="number" step="0.01" name="exams[]" class="form-control mark-input" value="<?php echo $examList[$i] ?? ''; ?>"><button type="button" class="btn btn-outline-danger remove-item" <?php echo $n <= 1 ? 'disabled' : ''; ?>><i class="bi bi-trash"></i></button></div></div>
                         <?php endfor; ?>
                     </div>
                 </div>
                 <div class="row g-3">
-                    <div class="col-md-4"><label class="form-label">Full (auto)</label><input type="number" step="0.01" class="form-control full-marks-input" value="<?php echo $row['full_marks']??''; ?>" readonly></div>
-                    <div class="col-md-4"><label class="form-label">%</label><input type="number" step="0.01" name="marks_percentage" class="form-control percentage-input" value="<?php echo $row['marks_percentage']??''; ?>"></div>
+                    <div class="col-md-4"><label class="form-label">Full (auto)</label><input type="number" step="0.01" class="form-control full-marks-input" value="<?php echo $row['full_marks'] ?? ''; ?>" readonly></div>
+                    <div class="col-md-4"><label class="form-label">%</label><input type="number" step="0.01" name="marks_percentage" class="form-control percentage-input" value="<?php echo $row['marks_percentage'] ?? ''; ?>"></div>
                     <div class="col-md-4"><label class="form-label">Status</label>
                         <select name="result_status" class="form-select" required>
-                            <?php foreach(['PENDING','PRESENT','ABSENT','NOT_ELIGIBLE'] as $st): ?>
-                            <option value="<?php echo $st; ?>" <?php echo ($row['result_status']??'')===$st?'selected':''; ?>><?php echo $st; ?></option>
+                            <?php foreach (['PENDING','PRESENT','ABSENT','NOT_ELIGIBLE'] as $st): ?>
+                            <option value="<?php echo $st; ?>" <?php echo ($row['result_status'] ?? '') === $st ? 'selected' : ''; ?>><?php echo $st; ?></option>
                             <?php endforeach; ?>
                         </select>
                     </div>
-                    <div class="col-12"><label class="form-label">Remarks</label><textarea name="remarks" class="form-control" rows="2"><?php echo sanitize($row['remarks']??''); ?></textarea></div>
+                    <div class="col-12"><label class="form-label">Remarks</label><textarea name="remarks" class="form-control" rows="2"><?php echo sanitize($row['remarks'] ?? ''); ?></textarea></div>
                 </div>
             </div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary">Save</button></div>
@@ -671,15 +508,56 @@ require_once __DIR__ . '/../includes/header.php';
 <?php endforeach; ?>
 
 <script>
-document.addEventListener('DOMContentLoaded',function(){
- function calc(f){let t=0,c=0;f.querySelectorAll('.mark-input').forEach(i=>{const v=parseFloat(i.value);if(!isNaN(v)){t+=v;c++;}});const a=f.querySelector('.full-marks-input'),p=f.querySelector('.percentage-input');if(a)a.value=t>0?t.toFixed(2):'';if(p)p.value=c>0?(t/c).toFixed(2):'';}
- document.body.addEventListener('input',e=>{if(e.target.classList.contains('mark-input')){const f=e.target.closest('form');if(f)calc(f);}});
- document.body.addEventListener('click',e=>{
-  const ba=e.target.closest('.add-assignment');if(ba){e.preventDefault();const box=ba.closest('.mb-3').querySelector('.assignments-container');const n=box.querySelectorAll('.assignment-item').length+1;const d=document.createElement('div');d.className='col-md-4 assignment-item';d.innerHTML=`<div class="input-group"><span class="input-group-text">A${n}</span><input type="number" step="0.01" name="assignments[]" class="form-control mark-input"><button type="button" class="btn btn-outline-danger remove-item"><i class="bi bi-trash"></i></button></div>`;box.appendChild(d);}
-  const be=e.target.closest('.add-exam');if(be){e.preventDefault();const box=be.closest('.mb-3').querySelector('.exams-container');const n=box.querySelectorAll('.exam-item').length+1;const d=document.createElement('div');d.className='col-md-4 exam-item';d.innerHTML=`<div class="input-group"><span class="input-group-text">E${n}</span><input type="number" step="0.01" name="exams[]" class="form-control mark-input"><button type="button" class="btn btn-outline-danger remove-item"><i class="bi bi-trash"></i></button></div>`;box.appendChild(d);}
-  const rm=e.target.closest('.remove-item');if(rm){e.preventDefault();const item=rm.closest('.assignment-item,.exam-item');const box=item.parentElement;const f=item.closest('form');item.remove();box.querySelectorAll('.assignment-item,.exam-item').forEach((it,i)=>{it.querySelector('.input-group-text').textContent=(box.classList.contains('assignments-container')?'A':'E')+(i+1);});if(f)calc(f);}
- });
- document.querySelectorAll('.result-form').forEach(calc);
+document.addEventListener('DOMContentLoaded', function () {
+    function calc(f) {
+        let t = 0, c = 0;
+        f.querySelectorAll('.mark-input').forEach(function (i) {
+            const v = parseFloat(i.value); if (!isNaN(v)) { t += v; c++; }
+        });
+        const a = f.querySelector('.full-marks-input'), p = f.querySelector('.percentage-input');
+        if (a) a.value = t > 0 ? t.toFixed(2) : '';
+        if (p) p.value = c > 0 ? (t / c).toFixed(2) : '';
+    }
+    document.body.addEventListener('input', function (e) {
+        if (e.target.classList.contains('mark-input')) {
+            const f = e.target.closest('form'); if (f) calc(f);
+        }
+    });
+    document.body.addEventListener('click', function (e) {
+        const ba = e.target.closest('.add-assignment');
+        if (ba) {
+            e.preventDefault();
+            const box = ba.closest('.mb-3').querySelector('.assignments-container');
+            const n = box.querySelectorAll('.assignment-item').length + 1;
+            const d = document.createElement('div');
+            d.className = 'col-md-4 assignment-item';
+            d.innerHTML = '<div class="input-group"><span class="input-group-text">A' + n + '</span><input type="number" step="0.01" name="assignments[]" class="form-control mark-input"><button type="button" class="btn btn-outline-danger remove-item"><i class="bi bi-trash"></i></button></div>';
+            box.appendChild(d);
+        }
+        const be = e.target.closest('.add-exam');
+        if (be) {
+            e.preventDefault();
+            const box = be.closest('.mb-3').querySelector('.exams-container');
+            const n = box.querySelectorAll('.exam-item').length + 1;
+            const d = document.createElement('div');
+            d.className = 'col-md-4 exam-item';
+            d.innerHTML = '<div class="input-group"><span class="input-group-text">E' + n + '</span><input type="number" step="0.01" name="exams[]" class="form-control mark-input"><button type="button" class="btn btn-outline-danger remove-item"><i class="bi bi-trash"></i></button></div>';
+            box.appendChild(d);
+        }
+        const rm = e.target.closest('.remove-item');
+        if (rm) {
+            e.preventDefault();
+            const item = rm.closest('.assignment-item, .exam-item');
+            const box = item.parentElement;
+            const f = item.closest('form');
+            item.remove();
+            box.querySelectorAll('.assignment-item, .exam-item').forEach(function (it, i) {
+                it.querySelector('.input-group-text').textContent = (box.classList.contains('assignments-container') ? 'A' : 'E') + (i + 1);
+            });
+            if (f) calc(f);
+        }
+    });
+    document.querySelectorAll('.result-form').forEach(calc);
 });
 </script>
 <?php require_once __DIR__ . '/../includes/footer.php'; ?>

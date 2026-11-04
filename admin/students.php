@@ -1,13 +1,10 @@
 <?php
 require_once __DIR__ . '/../includes/auth.php';
-require_once __DIR__ . '/../includes/xlsx_helper.php';
 requireLogin();
 $pageTitle = 'Students';
 $conn = getConnection();
 
-// ============================================
-// AJAX: Next Registration Number
-// ============================================
+// AJAX: get next registration number for a batch
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'next_reg') {
     header('Content-Type: application/json');
     $batch_id = (int)($_GET['batch_id'] ?? 0);
@@ -55,128 +52,6 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'next_reg') {
     exit;
 }
 
-// ============================================
-// BULK UPLOAD  (HDICRA.xlsx  OR  simple CSV/XLSX)
-// ============================================
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'upload') {
-    $admin    = getAdminUsername();
-    $uploaded = 0;
-    $skipped  = 0;
-    $dupes    = 0;
-    $errors   = [];
-
-    if (!isset($_FILES['excel_file']) || $_FILES['excel_file']['error'] !== UPLOAD_ERR_OK) {
-        setFlash('error', 'Please select a valid Excel/CSV file.');
-        redirect('students.php');
-    }
-
-    $file    = $_FILES['excel_file'];
-    $ext     = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    $tmpPath = $file['tmp_name'];
-
-    if (!in_array($ext, ['xlsx', 'csv'])) {
-        setFlash('error', 'Only .xlsx or .csv files are allowed. (For .xls: open it in Excel and Save As .xlsx)');
-        redirect('students.php');
-    }
-
-    // ---------- Read file into $allSheets[sheetName] = rows ----------
-    $allSheets = [];
-    if ($ext === 'csv') {
-        $rows = [];
-        $h = fopen($tmpPath, 'r');
-        $bom = fread($h, 3);
-        if ($bom !== "\xEF\xBB\xBF") rewind($h);
-        while (($d = fgetcsv($h)) !== false) $rows[] = $d;
-        fclose($h);
-        $allSheets['CSV'] = $rows;
-    } else {
-        $allSheets = readXlsxAllSheets($tmpPath);
-        if (empty($allSheets)) {
-            setFlash('error', 'Could not read the Excel file. Try Save As → CSV UTF-8.');
-            redirect('students.php');
-        }
-    }
-
-    // ---------- Process every sheet ----------
-    foreach ($allSheets as $sheetName => $rows) {
-        if (empty($rows)) continue;
-
-        $map = detectStudentColumns($rows);
-        if ($map['header_row'] === null) {
-            $errors[] = "$sheetName: header row not recognised — sheet skipped (need 'Reg No' + 'Name', or course_code + batch_code + full_name)";
-            continue;
-        }
-
-        for ($r = $map['header_row'] + 1; $r < count($rows); $r++) {
-            $row    = $rows[$r];
-            $lineNo = $r + 1;
-
-            $reg    = cellVal($row, $map['reg']);
-            $name   = cellVal($row, $map['name']);
-            $phone  = cellVal($row, $map['phone']);
-            $phone2 = cellVal($row, $map['phone2']);
-            $addr   = cellVal($row, $map['address']);
-            $course = cellVal($row, $map['course']);
-            $batch  = cellVal($row, $map['batch']);
-
-            // HDICRA Batch-08 style: real reg no may be in col 0 / col 1
-            if ($reg !== '' && !isRegNo($reg) && $map['course'] === null) {
-                $c0 = cellVal($row, 0);
-                $c1 = cellVal($row, 1);
-                if (isRegNo($c0))      $reg = $c0;
-                elseif (isRegNo($c1))  $reg = $c1;
-            }
-
-            // completely empty row
-            if ($reg === '' && $name === '' && $course === '' && $batch === '') continue;
-
-            // HDICRA sheets contain junk rows (totals, notes) → skip rows without a valid Reg No
-            if ($map['course'] === null && !isRegNo($reg)) continue;
-
-            // Excel may give phone as float (771234567.0)
-            foreach (['phone', 'phone2'] as $pv) {
-                if (is_numeric($$pv) && strpos($$pv, '.') !== false) $$pv = (string)(int)(float)$$pv;
-            }
-
-            // Validation for simple CSV format
-            if ($name === '') {
-                $errors[] = "$sheetName Row $lineNo: Missing full_name";
-                $skipped++;
-                continue;
-            }
-            if (($course === '' || $batch === '') && !isRegNo($reg)) {
-                $errors[] = "$sheetName Row $lineNo: Missing course_code / batch_code (and Reg No is not like ICRA/B01/001)";
-                $skipped++;
-                continue;
-            }
-
-            $res = importOneStudent($conn, $reg, $name, $phone, $course, $batch, $phone2, $addr);
-            if ($res === 'new') {
-                $uploaded++;
-            } elseif ($res === 'exists') {
-                $dupes++;
-                $skipped++;
-            } else {
-                $errors[] = "$sheetName Row $lineNo ($reg): $res";
-                $skipped++;
-            }
-        }
-    }
-
-    logActivity($admin, 'BULK_UPLOAD_STUDENTS', "Uploaded: $uploaded | Already existed: $dupes | Skipped: $skipped");
-
-    $msg = "Bulk upload finished. New students: $uploaded | Already existed: $dupes | Skipped: $skipped";
-    if (!empty($errors)) {
-        $msg .= " | Errors: " . count($errors);
-        $_SESSION['upload_errors'] = array_slice($errors, 0, 20);
-    }
-    setFlash('success', $msg);
-    redirect('students.php');
-}
-
-// ============================================
-// SINGLE ADD / EDIT / DELETE
-// ============================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
@@ -207,7 +82,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($stmt->execute()) {
                     $sid = $stmt->insert_id;
                     $conn->query("INSERT INTO results (student_id, result_status) VALUES ($sid, 'PENDING')");
-                    $conn->query("INSERT INTO payments (student_id, payment_status) VALUES ($sid, 'PENDING')");
+                    // Payment row with empty fee fields so Payments page shows editable installments
+                    $hasReg = false; $hasInst = false;
+                    try {
+                        $hasReg = ($conn->query("SHOW COLUMNS FROM payments LIKE 'reg_fee'")->num_rows > 0);
+                        $hasInst = ($conn->query("SHOW COLUMNS FROM payments LIKE 'installments_json'")->num_rows > 0);
+                    } catch (Throwable $e) {}
+                    if ($hasReg && $hasInst) {
+                        $conn->query("INSERT INTO payments (student_id, payment_status, reg_fee, course_paid, course_due, balance, amount, installments_json) VALUES ($sid, 'PENDING', 0, 0, 0, 0, 0, '{}')");
+                    } elseif ($hasReg) {
+                        $conn->query("INSERT INTO payments (student_id, payment_status, reg_fee, course_paid, course_due, balance, amount) VALUES ($sid, 'PENDING', 0, 0, 0, 0, 0)");
+                    } else {
+                        $conn->query("INSERT INTO payments (student_id, payment_status) VALUES ($sid, 'PENDING')");
+                    }
                     $conn->query("INSERT INTO certificates (student_id, certificate_status) VALUES ($sid, 'PENDING')");
                     logActivity(getAdminUsername(), 'ADD_STUDENT', $reg);
                     setFlash('success', 'Student added successfully. Reg: ' . $reg);
@@ -283,9 +170,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// ============================================
-// FILTERS + DATA FETCH
-// ============================================
 $filterCourse = isset($_GET['course_id']) ? (int)$_GET['course_id'] : 0;
 $filterBatch  = isset($_GET['batch_id']) ? (int)$_GET['batch_id'] : 0;
 $search       = trim($_GET['q'] ?? '');
@@ -301,7 +185,7 @@ while ($b = $batchesList->fetch_assoc()) $batchesArr[] = $b;
 $sql = "
     SELECT s.*, b.batch_code, b.batch_name, c.course_code, c.course_name,
            r.result_status, r.marks_percentage, r.full_marks,
-           p.payment_status, p.amount, cert.certificate_status
+           p.payment_status, cert.certificate_status
     FROM students s
     JOIN batches b ON s.batch_id = b.id
     JOIN courses c ON b.course_id = c.id
@@ -322,70 +206,12 @@ $students = $conn->query($sql);
 require_once __DIR__ . '/../includes/header.php';
 ?>
 
-<!-- ==================== PAGE HEADER ==================== -->
-<div class="page-header d-flex justify-content-end align-items-center mb-3 gap-2">
-    <button class="btn btn-success" data-bs-toggle="modal" data-bs-target="#uploadModal">
-        <i class="bi bi-file-earmark-excel me-1"></i> Bulk Upload
-    </button>
+<div class="page-header d-flex justify-content-end align-items-center mb-3">
     <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addModal">
         <i class="bi bi-plus-lg me-1"></i> Add Student
     </button>
 </div>
 
-<!-- ==================== UPLOAD MODAL ==================== -->
-<div class="modal fade" id="uploadModal" tabindex="-1">
-    <div class="modal-dialog">
-        <div class="modal-content">
-            <form method="POST" enctype="multipart/form-data">
-                <div class="modal-header">
-                    <h5 class="modal-title"><i class="bi bi-file-earmark-excel"></i> Bulk Upload Students</h5>
-                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-                </div>
-                <div class="modal-body">
-                    <input type="hidden" name="action" value="upload">
-                    <div class="mb-3">
-                        <label class="form-label">Select Excel / CSV File</label>
-                        <input type="file" name="excel_file" class="form-control" accept=".xlsx,.csv" required>
-                        <small class="text-muted">Supported: .xlsx, .csv (all sheets are read)</small>
-                    </div>
-                    <div class="alert alert-info mb-0 small">
-                        <strong>2 formats accepted:</strong>
-                        <ol class="mb-0 ps-3 mt-1">
-                            <li><strong>HDICRA.xlsx</strong> (Batch 01, Batch 02 ... sheets) — columns <code>Reg No</code>, <code>Name</code>, <code>WhatsApp</code>.
-                                Course &amp; batch are taken from the Reg No (e.g. <code>ICRA/B01/001</code>); missing course/batch are created automatically.</li>
-                            <li><strong>Simple file</strong> — <code>course_code</code>, <code>batch_code</code>, <code>full_name</code>
-                                (optional: <code>registration_number</code>, <code>phone</code>, <code>phone2</code>, <code>address</code>).
-                                Empty registration number = auto-generated.</li>
-                        </ol>
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <a href="Students_Bulk_Upload_Sample.xlsx" class="btn btn-outline-success me-auto" download>
-                        <i class="bi bi-download"></i> Sample Excel
-                    </a>
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                    <button type="submit" class="btn btn-success">
-                        <i class="bi bi-upload"></i> Upload &amp; Process
-                    </button>
-                </div>
-            </form>
-        </div>
-    </div>
-</div>
-
-<?php if (!empty($_SESSION['upload_errors'])): ?>
-<div class="alert alert-warning alert-dismissible fade show">
-    <strong>Some rows had issues:</strong>
-    <ul class="mb-0 mt-1">
-        <?php foreach ($_SESSION['upload_errors'] as $err): ?>
-            <li><?php echo htmlspecialchars($err); ?></li>
-        <?php endforeach; ?>
-    </ul>
-    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-</div>
-<?php unset($_SESSION['upload_errors']); endif; ?>
-
-<!-- ==================== FILTER BAR ==================== -->
 <div class="filter-bar">
     <form method="GET" class="row g-2 align-items-end">
         <div class="col-md-3">
@@ -420,7 +246,6 @@ require_once __DIR__ . '/../includes/header.php';
     </form>
 </div>
 
-<!-- ==================== TABLE ==================== -->
 <div class="card table-card">
     <div class="table-responsive">
         <table class="table table-hover mb-0" id="dataTable">
@@ -456,7 +281,7 @@ require_once __DIR__ . '/../includes/header.php';
                         ?>
                     </td>
                     <td><?php echo $row['result_status'] ? statusBadge($row['result_status']) : '—'; ?></td>
-                    <td><?php echo $row['payment_status'] ? statusBadge($row['payment_status']) : '—'; ?><?php if ($row['amount'] !== null && (float)$row['amount'] > 0): ?><br><small class="text-muted">Rs <?php echo number_format((float)$row['amount'], 0); ?></small><?php endif; ?></td>
+                    <td><?php echo $row['payment_status'] ? statusBadge($row['payment_status']) : '—'; ?></td>
                     <td><?php echo $row['certificate_status'] ? statusBadge($row['certificate_status']) : '—'; ?></td>
                     <td>
                         <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editModal<?php echo $row['id']; ?>" title="Edit">
@@ -470,7 +295,6 @@ require_once __DIR__ . '/../includes/header.php';
                     </td>
                 </tr>
 
-                <!-- Edit Modal -->
                 <div class="modal fade" id="editModal<?php echo $row['id']; ?>" tabindex="-1">
                     <div class="modal-dialog modal-lg">
                         <div class="modal-content">
@@ -532,7 +356,7 @@ require_once __DIR__ . '/../includes/header.php';
     </div>
 </div>
 
-<!-- ==================== ADD MODAL ==================== -->
+<!-- Add Modal -->
 <div class="modal fade" id="addModal" tabindex="-1">
     <div class="modal-dialog modal-lg">
         <div class="modal-content">
@@ -599,6 +423,7 @@ require_once __DIR__ . '/../includes/header.php';
 </div>
 
 <script>
+// Batches data for filtering
 const allBatches = <?php echo json_encode(array_map(function($b) {
     return [
         'id' => (int)$b['id'],
@@ -676,6 +501,7 @@ if (btnRegen) {
     });
 }
 
+// Reset form when modal opens
 const addModal = document.getElementById('addModal');
 if (addModal) {
     addModal.addEventListener('show.bs.modal', function () {
